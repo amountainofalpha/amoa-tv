@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { font-family: -apple-system, sans-serif; background: #18181b; color: #d4d4d8; margin: 0; padding: 16px; width: 280px; font-size: 13px; }
+  h1 { font-size: 14px; margin: 0 0 12px; }
+  .row { display: flex; justify-content: space-between; align-items: center; margin: 10px 0; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .dot.ok  { background: #22c55e; }
+  .dot.bad { background: #ef4444; }
+  button { background: #27272a; color: #d4d4d8; border: 1px solid #3f3f46; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+  button:hover { background: #3f3f46; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  select { background: #18181b; color: #d4d4d8; border: 1px solid #3f3f46; border-radius: 4px; padding: 3px 6px; font-size: 12px; }
+  .muted { color: #71717a; font-size: 11px; margin-top: 12px; }
+  .err   { color: #ef4444; font-size: 11px; margin-top: 8px; word-wrap: break-word; }
+</style>
+</head>
+<body>
+  <h1>AMOA TV Overlay</h1>
+
+  <div class="row">
+    <span>Environment</span>
+    <select id="env">
+      <option value="prod">prod</option>
+      <option value="dev">dev</option>
+    </select>
+  </div>
+
+  <div class="row">
+    <span><span id="dot" class="dot bad"></span><span id="status">checking...</span></span>
+    <button id="authBtn">Sign in</button>
+  </div>
+
+  <div id="err" class="err" hidden></div>
+  <div class="muted">Overlays load automatically when you open a TradingView chart.</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
