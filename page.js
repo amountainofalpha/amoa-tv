@@ -17,7 +17,33 @@
   // "tv-scripting" and the server-returned metainfo id has a build-stamp
   // suffix like "-101".
   const AMOA_PINE_ID = 'USER;91ba7cf3139447a3b3fb0930e49271e8';
-  const AMOA_PINE_VERSION = '5.0';
+  const AMOA_PINE_VERSION = 'last';
+  const AMOA_OHLC_PINE_ID = 'USER;4188b047d90c4ee3b626a7b16a5a4d48';
+  const AMOA_OHLC_PINE_VERSION = 'last';
+  // Two study "kinds":
+  //   'overlay' → left-axis (percent / ratio / count / days …). Description
+  //               'AMOA Overlay'. Last slot is the zero reference line.
+  //   'ohlc'    → right-axis (aligned with OHLC candles). Description
+  //               'AMOA OHLC'. Every slot is a metric slot; no zero line.
+  const SIGNED_UNITS = new Set(['percent', 'ratio', 'ratio_0_1']);
+  const STUDY_KINDS = {
+    overlay: {
+      pineId: AMOA_PINE_ID,
+      pineVersion: AMOA_PINE_VERSION,
+      descPrefix: 'AMOA Overlay',
+      hasZeroLine: true,
+    },
+    ohlc: {
+      pineId: AMOA_OHLC_PINE_ID,
+      pineVersion: AMOA_OHLC_PINE_VERSION,
+      descPrefix: 'AMOA OHLC',
+      hasZeroLine: false,
+    },
+  };
+  // Synthetic unit key for the shared right-axis study — paired-strike
+  // metrics all bucket into this one record regardless of what their
+  // catalog unit is (usd, in most cases).
+  const OHLC_UNIT_KEY = 'ohlc';
   const log = (...a) => console.log('[amoa-tv:page]', ...a);
   window.__amoa_tv_loaded = true;
   log('page.js loaded, url=', location.href);
@@ -25,9 +51,29 @@
   // Per-metric drawing tracking so we can clear one overlay without touching
   // others (and clear everything when the symbol changes).
   const drawingsByMetric = new Map(); // metric → Set<sourceId>
-  const studiesByMetric = new Map();  // metric → sourceId of a hijacked study
+  // Non-price metrics share one AMOA study per unit (all `percent` metrics
+  // share one axis, all `days` metrics share another, etc.). Two parallel
+  // maps: metric → sourceId for cleanup bookkeeping, unit → sourceId for
+  // discovery / reuse.
+  const studiesByMetric = new Map();  // metric → sourceId of its unit's shared study
+  // Per-unit study record. One AMOA study is inserted per unit; up to
+  // metaInfo.plots.length metrics can share that study as separate plot
+  // lines on the same axis. slotByMetric assigns each metric a plot index;
+  // dataByMetric retains each metric's points so we can rebuild the
+  // combined value array (which must carry every metric's value at every
+  // bar the axis covers) whenever any single metric updates.
+  //   Map<unit, {
+  //     sourceId, numSlots,
+  //     slotByMetric: Map<metric, slotIdx>,
+  //     dataByMetric: Map<metric, {time, value}[]>,
+  //   }>
+  const studyByUnit = new Map();
+  const studyInsertInFlight = new Map(); // unit → Promise<sourceId|null>
   let currentSymbol = null;
   let debounceTimer = null;
+  // Serial queue for drawSeries calls — ensures per-unit study insert
+  // dedup works even when multiple metrics fire back-to-back.
+  let drawSeriesQueue = Promise.resolve();
   let webpackRequire = null;
   let lineToolLoader = null;
 
@@ -123,7 +169,13 @@
     }
     if (msg.type === 'drawSeries') {
       if (msg.symbol !== currentSymbol) { log('stale draw for', msg.symbol, '(current=', currentSymbol, ')'); return; }
-      drawSeries(msg.metric, msg.color, msg.points, msg.isStrike, msg.label, msg.symbol, msg.unit);
+      // Serialize: each drawSeries fully completes before the next runs, so
+      // the first same-unit metric's study insert is done and stored in
+      // studiesByUnit before the second one asks for it. Simpler than
+      // per-unit in-flight dedup and cheaper than a batching protocol.
+      drawSeriesQueue = drawSeriesQueue.then(() => drawSeries(
+        msg.metric, msg.color, msg.points, msg.isStrike, msg.label, msg.symbol, msg.unit
+      )).catch((e) => log('drawSeries error', e?.message || e));
       return;
     }
     if (msg.type === 'clearMetric') { clearMetric(msg.metric); return; }
@@ -148,7 +200,7 @@
     // the OHLC scale — their values are on a totally different range. Push
     // them into a hijacked study which comes with its own left-hand axis.
     if (!isStrike && unit && !PRICE_UNITS.has(unit)) {
-      await drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent });
+      await drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent, unit, kind: 'overlay' });
       return;
     }
 
@@ -157,8 +209,17 @@
 
     const hasExpiration = points.some(p => p.expiration != null);
     if (isStrike && hasExpiration) {
-      await drawStrikeExpirationRuns({ model, pane, ts, points, color, ids, stillCurrent, metric });
-      log('drew', ids.size, 'paired-strike run segments for', metric);
+      // Render paired strike + expiration as dots on every weekday from
+      // each snapshot up through its expiration — a trail of dots at the
+      // strike price. Plot style is Circles (set in applyAmoaSlotStyling),
+      // so there's no line connecting different strikes; each row of dots
+      // just marks "this strike was the peak from date A to date B".
+      const expanded = expandRunsToBarPoints(points, ts);
+      await drawViaStudyHijack({
+        w, model, metric, label, color,
+        points: expanded, ts, stillCurrent,
+        unit: OHLC_UNIT_KEY, kind: 'ohlc',
+      });
       return;
     }
 
@@ -240,6 +301,55 @@
     props.showLabel?.setValue?.(false);
   }
 
+  // Turn paired strike + expiration observations into a bar-by-bar
+  // {time, value} series. Consecutive observations with the same
+  // (strike, expiration) collapse into a run; each run then fills every
+  // trading day from run.start to min(next.start, this.expiration) with
+  // the strike price. Days between runs (or after all runs end) get no
+  // point at all, so TV renders those as breaks in the study's line.
+  function expandRunsToBarPoints(points, ts) {
+    const obs = points
+      .filter(p => p.expiration != null && Number.isFinite(p.value))
+      .sort((a, b) => a.time - b.time);
+    if (!obs.length) return [];
+    const runs = [];
+    let cur = null;
+    for (const o of obs) {
+      if (!cur || cur.value !== o.value || cur.expiration !== o.expiration) {
+        if (cur) runs.push(cur);
+        cur = { value: o.value, expiration: o.expiration, start: o.time };
+      }
+    }
+    if (cur) runs.push(cur);
+
+    const expanded = [];
+    const DAY = 86400;
+    for (let i = 0; i < runs.length; i++) {
+      const r = runs[i];
+      const next = runs[i + 1];
+      const endTime = next && r.expiration > next.start ? next.start : r.expiration;
+      // Fill weekdays inside the run with the strike price.
+      for (let t = r.start; t <= endTime; t += DAY) {
+        const wd = new Date(t * 1000).getUTCDay();
+        if (wd === 0 || wd === 6) continue;
+        expanded.push({ time: t, value: r.value });
+      }
+      // Explicit null right after the run so TV's plot renderer BREAKS
+      // the line here — otherwise it draws a diagonal between the end of
+      // this run and the start of the next run at a different strike.
+      if (next) {
+        // Find the next weekday after endTime and push null there.
+        for (let t = endTime + DAY; t < next.start; t += DAY) {
+          const wd = new Date(t * 1000).getUTCDay();
+          if (wd === 0 || wd === 6) continue;
+          expanded.push({ time: t, value: null });
+          break; // one null is enough to break the line
+        }
+      }
+    }
+    return expanded;
+  }
+
   async function drawStrikeExpirationRuns({ model, pane, ts, points, color, ids, stillCurrent, metric }) {
     await ensureLineToolReady('LineToolTrendLine');
     if (stillCurrent && !stillCurrent()) return;
@@ -309,18 +419,25 @@
   // separate left-hand price scale that auto-fits its data range. We then
   // overwrite its computed values with ours so the axis lands where the
   // user's metric actually lives — no normalization, no shared price scale.
-  async function drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent }) {
-    const sourceId = await ensureAmoaStudy({ w, model, metric, label, color, stillCurrent });
-    if (!sourceId) {
+  async function drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent, unit, kind }) {
+    const record = await ensureAmoaStudyRecord({ w, model, metric, unit, kind, label, color, stillCurrent });
+    if (!record) {
       log('no AMOA Overlay study available for', metric,
           '— add one AMOA Overlay Pine indicator to your chart once so the extension can clone more.');
       return;
     }
     if (stillCurrent && !stillCurrent()) return;
-    const src = model.dataSourceForId(sourceId);
-    if (!src) { studiesByMetric.delete(metric); return; }
-    const added = pushMetricDataToStudy(src, points, ts);
-    log('pushed', added, 'points into AMOA study for', metric);
+    const src = model.dataSourceForId(record.sourceId);
+    if (!src) {
+      studiesByMetric.delete(metric);
+      studyByUnit.delete(unit);
+      return;
+    }
+    record.dataByMetric.set(metric, points);
+    const added = pushCombinedDataToStudy(src, record, ts);
+    log('pushed', added, 'combined points to AMOA', unit, 'study — metric', metric,
+        'in slot', record.slotByMetric.get(metric),
+        '(of', record.numSlots + ' slots)');
   }
 
   // First, claim an unclaimed AMOA source already on the chart. If they're
@@ -328,55 +445,128 @@
   // insertStudy another copy using that same id, wait for it to attach,
   // and claim it. This turns "user manually added ONE AMOA Overlay" into
   // "extension can host N of them" without any per-user studyId configuration.
-  async function ensureAmoaStudy({ w, model, metric, label, color, stillCurrent }) {
-    const existing = studiesByMetric.get(metric);
-    if (existing && model.dataSourceForId(existing)) {
-      applyAmoaStudyStyling(model.dataSourceForId(existing), label, color);
-      return existing;
+  async function ensureAmoaStudyRecord({ w, model, metric, unit, kind, label, color, stillCurrent }) {
+    let record = studyByUnit.get(unit);
+    if (record && model.dataSourceForId(record.sourceId)) {
+      claimSlot(record, metric, color);
+      applyAmoaSlotStyling(model.dataSourceForId(record.sourceId), record, metric, label, color);
+      studiesByMetric.set(metric, record.sourceId);
+      return record;
     }
-    const claimTarget = await findClaimableAmoaSource(model, metric, label, color, stillCurrent);
-    if (claimTarget) return claimTarget;
-
-    log('inserting AMOA Pine study for', metric);
-    const before = new Set(model.dataSources().map(getId));
-    let result, err;
-    try {
-      result = await w.insertStudy(
-        { type: 'pine', pineId: AMOA_PINE_ID, pineVersion: AMOA_PINE_VERSION },
-        []
-      );
-    } catch (e) { err = e?.message || String(e); }
-    if (err) { log('insertStudy threw', err); return null; }
-    if (!result) { log('insertStudy returned null (Pine)'); return null; }
-    if (stillCurrent && !stillCurrent()) return null;
-
-    // Poll for the newly attached source. Match by description because the
-    // studyId TV assigns post-insert can drop the `-101` build-stamp suffix.
-    let src = null;
-    for (let i = 0; i < 40; i++) {
-      const sources = model.dataSources();
-      src = sources.find((s) => {
-        if (before.has(getId(s))) return false;
-        const m = typeof s.metaInfo === 'function' ? s.metaInfo() : s._metaInfo;
-        return m?.description?.startsWith?.(AMOA_STUDY_DESC_PREFIX);
-      });
-      if (src) break;
-      await new Promise(r => setTimeout(r, 50));
-    }
+    const sourceId = await ensureAmoaStudy({ w, model, metric, unit, kind, stillCurrent });
+    if (!sourceId) return null;
+    const src = model.dataSourceForId(sourceId);
     if (!src) return null;
-    const id = getId(src);
-    studiesByMetric.set(metric, id);
-    applyAmoaStudyStyling(src, label, color);
-    return id;
+    const meta = typeof src.metaInfo === 'function' ? src.metaInfo() : src._metaInfo;
+    const numSlots = meta?.plots?.length || 1;
+    const kindDef = STUDY_KINDS[kind] || STUDY_KINDS.overlay;
+    // Only the overlay kind reserves the last slot for a zero-reference
+    // line; the OHLC kind uses every slot for a metric.
+    const zeroSlot = kindDef.hasZeroLine && numSlots > 1 ? numSlots - 1 : null;
+    const metricSlots = zeroSlot != null ? zeroSlot : numSlots;
+    record = studyByUnit.get(unit);
+    if (!record) {
+      record = {
+        sourceId, unit, kind, numSlots, metricSlots, zeroSlot,
+        slotByMetric: new Map(), dataByMetric: new Map(),
+      };
+      studyByUnit.set(unit, record);
+    } else {
+      record.kind = kind;
+      record.numSlots = numSlots;
+      record.metricSlots = metricSlots;
+      record.zeroSlot = zeroSlot;
+    }
+    installVisibilityGuard(model, record);
+    claimSlot(record, metric, color);
+    applyAmoaSlotStyling(src, record, metric, label, color);
+    studiesByMetric.set(metric, sourceId);
+    return record;
+  }
+
+  // Assign this metric a plot slot. Prefer keeping the same slot on repeat
+  // draws so colors don't shuffle; otherwise take the first free slot; if
+  // all slots are taken, evict the oldest metric (first added) so newer
+  // picks stay visible.
+  function claimSlot(record, metric, color) {
+    if (record.slotByMetric.has(metric)) return record.slotByMetric.get(metric);
+    const taken = new Set(record.slotByMetric.values());
+    const cap = record.metricSlots || record.numSlots;
+    for (let i = 0; i < cap; i++) {
+      if (!taken.has(i)) { record.slotByMetric.set(metric, i); return i; }
+    }
+    const [oldestMetric, oldestSlot] = record.slotByMetric.entries().next().value;
+    record.slotByMetric.delete(oldestMetric);
+    record.dataByMetric.delete(oldestMetric);
+    record.slotByMetric.set(metric, oldestSlot);
+    log('AMOA', 'unit slots full — evicted', oldestMetric, 'for', metric);
+    return oldestSlot;
+  }
+
+  async function ensureAmoaStudy({ w, model, metric, unit, kind, stillCurrent }) {
+    const inflight = studyInsertInFlight.get(unit);
+    if (inflight) {
+      log('awaiting in-flight AMOA study insert for unit', unit, 'from', metric);
+      return await inflight;
+    }
+    const existing = studyByUnit.get(unit);
+    if (existing && model.dataSourceForId(existing.sourceId)) return existing.sourceId;
+    const kindDef = STUDY_KINDS[kind] || STUDY_KINDS.overlay;
+    // Match by the pineId hash embedded in metaInfo.id — that's the
+    // authoritative identifier and doesn't depend on the Pine's
+    // description string (which the user can name anything).
+    const wantedHash = (kindDef.pineId.match(/(USER|PUB);[a-f0-9]+/i) || [])[0];
+    const claimed = new Set([...studyByUnit.values()].map(r => r.sourceId));
+    for (const s of model.dataSources()) {
+      if (!s || s.isLineTool) continue;
+      const meta = typeof s.metaInfo === 'function' ? s.metaInfo() : s._metaInfo;
+      const mid = meta?.id || '';
+      if (!wantedHash || !mid.includes(wantedHash)) continue;
+      const id = getId(s);
+      if (claimed.has(id)) continue;
+      return id;
+    }
+
+    log('inserting AMOA Pine study for', metric, 'unit=', unit, 'kind=', kind);
+    const insertPromise = (async () => {
+      const before = new Set(model.dataSources().map(getId));
+      let result, err;
+      try {
+        result = await w.insertStudy(
+          { type: 'pine', pineId: kindDef.pineId, pineVersion: kindDef.pineVersion },
+          []
+        );
+      } catch (e) { err = e?.message || String(e); }
+      if (err) { log('insertStudy threw', err); return null; }
+      if (!result) { log('insertStudy returned null (Pine)'); return null; }
+      if (stillCurrent && !stillCurrent()) return null;
+
+      const wantedHash = (kindDef.pineId.match(/(USER|PUB);[a-f0-9]+/i) || [])[0];
+      let src = null;
+      for (let i = 0; i < 40; i++) {
+        const sources = model.dataSources();
+        src = sources.find((s) => {
+          if (before.has(getId(s))) return false;
+          const m = typeof s.metaInfo === 'function' ? s.metaInfo() : s._metaInfo;
+          return (m?.id || '').includes(wantedHash);
+        });
+        if (src) break;
+        await new Promise(r => setTimeout(r, 50));
+      }
+      if (!src) return null;
+      return getId(src);
+    })();
+    studyInsertInFlight.set(unit, insertPromise);
+    return await insertPromise.finally(() => studyInsertInFlight.delete(unit));
   }
 
   // Look up to 1s for any AMOA source on the chart. First unclaimed wins;
   // if all are claimed, we don't hijack — returning null makes us fall
   // through to insertStudy for another copy.
-  async function findClaimableAmoaSource(model, metric, label, color, stillCurrent) {
+  async function findClaimableAmoaSource(model, metric, unit, label, color, stillCurrent) {
     for (let attempt = 0; attempt < 10; attempt++) {
       if (stillCurrent && !stillCurrent()) return null;
-      const claimed = new Set([...studiesByMetric.values()]);
+      const claimed = new Set([...studiesByUnit.values()]);
       for (const s of model.dataSources()) {
         if (!s || s.isLineTool) continue;
         const meta = typeof s.metaInfo === 'function' ? s.metaInfo() : s._metaInfo;
@@ -384,6 +574,7 @@
         const id = String(s._id?.value?.() ?? s._id);
         if (claimed.has(id)) continue;
         studiesByMetric.set(metric, id);
+        studiesByUnit.set(unit, id);
         applyAmoaStudyStyling(s, label, color);
         return id;
       }
@@ -433,50 +624,180 @@
   }
 
   function applyAmoaStudyStyling(src, label, color) {
-    if (!src?._properties) return;
-    // Rename so the legend reads the metric label instead of "AMOA Overlay".
-    try { src._properties.title?.setValue?.(label); } catch (_) {}
-    // The Pine sets color as fully transparent; make our plot visible in
-    // the metric's color. Property path is styles.plot_0.color.
+    if (!src) return;
+    // Rename the study so the plot legend reads the metric label instead
+    // of just "AMOA". The legend text is driven by metaInfo.description,
+    // so mutate both the cached copy and the version returned by the
+    // metaInfo() method (some code paths call one, some the other).
     try {
-      const styles = src._properties.styles;
-      const plot0 = styles?.plot_0 || styles?.childs?.().plot_0;
-      const colorProp = plot0?.color || plot0?.childs?.().color;
-      colorProp?.setValue?.(color);
+      if (src._metaInfo) src._metaInfo.description = label;
+      if (src._metaInfo) src._metaInfo.shortDescription = label;
+      const m = typeof src.metaInfo === 'function' ? src.metaInfo() : null;
+      if (m) { m.description = label; m.shortDescription = label; }
     } catch (_) {}
+    if (src._properties) {
+      try { src._properties.title?.setValue?.(label); } catch (_) {}
+      try { src._properties.description?.setValue?.(label); } catch (_) {}
+      // The Pine defines the plot as fully transparent; make our plot
+      // visible in the metric's color. Property path is styles.plot_0.color.
+      try {
+        const styles = src._properties.styles;
+        const plot0 = styles?.plot_0 || styles?.childs?.().plot_0;
+        const colorProp = plot0?.color || plot0?.childs?.().color;
+        colorProp?.setValue?.(color);
+      } catch (_) {}
+    }
+    // Poke the study to re-render its legend now that description changed.
+    try { src.updateAllViews?.(); } catch (_) {}
   }
 
-  function pushMetricDataToStudy(src, points, ts) {
+  // Rebuild the study's plot list from every metric currently hosted in
+  // its slots. Each row is [time_sec, ...slot_values]. Bars where a slot's
+  // metric has no data get null in that position — TradingView renders
+  // gaps in the line rather than plotting through them.
+  // TV clears our custom study data whenever the user hides + re-shows the
+  // study (its hide/show flow re-fetches server-side plot rows, wiping our
+  // frozen writes). Instead of hooking the visibility WatchedValue (which
+  // put us inside TV's fire chain and caused unrelated apply-of-undefined
+  // errors), poll the study's data length. If it goes empty while we still
+  // have overlay data in memory, re-push.
+  let visibilityWatcher = null;
+  function installVisibilityGuard(model, record) {
+    if (visibilityWatcher) return; // one shared poll covers every study
+    visibilityWatcher = setInterval(() => {
+      for (const r of studyByUnit.values()) {
+        if (!r.dataByMetric.size) continue;
+        const src = model.dataSourceForId(r.sourceId);
+        if (!src) continue;
+        const size = src.data?.()?.size?.();
+        if (size === 0) {
+          const ts = model.timeScale?.();
+          if (!ts) continue;
+          const n = pushCombinedDataToStudy(src, r, ts);
+          log('re-pushed', n, 'points to AMOA', r.unit, 'after data cleared');
+        }
+      }
+    }, 500);
+  }
+
+  function pushCombinedDataToStudy(src, record, ts) {
     const data = src.data();
-    // AMOA Overlay Pine study is single-plot so its value array is exactly
-    // [time_sec, value] — no template needed, no palette slots to preserve.
+    const byTime = new Map();
+    const width = 1 + record.numSlots;
+    const wantsZeroLine = SIGNED_UNITS.has(record.unit) && record.zeroSlot != null;
+    for (const [metric, points] of record.dataByMetric.entries()) {
+      const slot = record.slotByMetric.get(metric);
+      if (slot == null) continue;
+      for (const p of points) {
+        let row = byTime.get(p.time);
+        if (!row) {
+          row = new Array(width).fill(null);
+          row[0] = p.time;
+          if (wantsZeroLine) row[1 + record.zeroSlot] = 0;
+          byTime.set(p.time, row);
+        }
+        row[1 + slot] = p.value;
+      }
+    }
+    // Convert to (barIndex, row) entries, sorted by index.
+    const rows = [];
+    for (const row of byTime.values()) {
+      const idx = ts.timePointToIndex(row[0], true);
+      if (!Number.isFinite(idx)) continue;
+      rows.push({ idx, row });
+    }
+    rows.sort((a, b) => a.idx - b.idx);
+
     data._shareRead = false;
     data.clear();
     let added = 0;
-    for (const p of points) {
-      const idx = ts.timePointToIndex(p.time, true);
-      if (!Number.isFinite(idx)) continue;
-      if (data.add(idx, [p.time, p.value]) !== false) added++;
+    for (const { idx, row } of rows) {
+      if (data.add(idx, row) !== false) added++;
     }
     data._shareRead = true;
     try { src._invalidateLastNonEmptyPlotRowCache?.(); } catch (_) {}
     return added;
   }
 
+  // Style a specific slot of the shared study: set its title to the metric
+  // label and its color to the metric's assigned overlay color.
+  function applyAmoaSlotStyling(src, record, metric, label, color) {
+    if (!src) return;
+    const slot = record.slotByMetric.get(metric);
+    if (slot == null) return;
+    const plotId = `plot_${slot}`;
+
+    // Color for the metric plot (the settings/customization tree).
+    const styles = src._properties?.styles;
+    const plotProps = styles?.[plotId] || styles?.childs?.()?.[plotId];
+    try { plotProps?.color?.setValue?.(color); } catch (_) {}
+    // For the OHLC (right-axis) kind, override the plot style to circles
+    // so each snapshot renders as a discrete dot instead of connecting via
+    // diagonals across strike jumps. TV's PlotStyle enum values:
+    //   Line=0, Histogram=1, Cross=3, Area=4, Columns=5, Circles=6,
+    //   LineWithBreaks=7, StepLine=9, StepLineWithBreaks=11.
+    if (record.kind === 'ohlc') {
+      try { plotProps?.plottype?.setValue?.(6); } catch (_) {}
+      try { plotProps?.linewidth?.setValue?.(3); } catch (_) {}
+    }
+
+    // Title lives in _metaInfo.value().styles[plotId].title — that's what
+    // TV's guiPlotName reads to build the legend row. Mutate then nudge
+    // the WatchedValue so the legend recomputes.
+    try {
+      const metaWv = src._metaInfo;
+      const meta = typeof metaWv?.value === 'function' ? metaWv.value() : metaWv;
+      if (meta?.styles?.[plotId]) meta.styles[plotId].title = label;
+      // Also label the reserved zero-line plot (last slot) so it reads
+      // clearly in the legend instead of the Pine default ("data 5" etc.).
+      if (record.zeroSlot != null) {
+        const zeroPlotId = `plot_${record.zeroSlot}`;
+        if (meta?.styles?.[zeroPlotId]) meta.styles[zeroPlotId].title = 'zero';
+      }
+      if (typeof metaWv?.fireChanged === 'function') metaWv.fireChanged();
+      else if (typeof metaWv?.setValue === 'function') metaWv.setValue(meta);
+    } catch (_) {}
+    try { src.updateAllViews?.(); } catch (_) {}
+  }
+
   function removeStudyForMetric(metric) {
     const id = studiesByMetric.get(metric);
     if (!id) return false;
+    studiesByMetric.delete(metric);
+    // Locate the unit record and free this metric's slot.
+    let ownerUnit = null, ownerRecord = null;
+    for (const [u, r] of studyByUnit.entries()) {
+      if (r.sourceId === id) { ownerUnit = u; ownerRecord = r; break; }
+    }
+    if (!ownerRecord) return true;
+    ownerRecord.slotByMetric.delete(metric);
+    ownerRecord.dataByMetric.delete(metric);
+    // Re-push so the removed metric's line disappears immediately.
     const model = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.()?.model?.();
     if (model) {
       const src = model.dataSourceForId(id);
-      if (src) { try { model.removeSource(src); } catch (_) {} }
+      const ts = model.timeScale?.();
+      if (src && ts && ownerRecord.slotByMetric.size > 0) {
+        pushCombinedDataToStudy(src, ownerRecord, ts);
+      } else if (src && ownerRecord.slotByMetric.size === 0) {
+        // No metrics left on this study — remove it entirely.
+        try { model.removeSource(src); } catch (_) {}
+        studyByUnit.delete(ownerUnit);
+      }
     }
-    studiesByMetric.delete(metric);
     return true;
   }
 
   function removeAllHijackStudies() {
-    for (const metric of [...studiesByMetric.keys()]) removeStudyForMetric(metric);
+    const model = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.()?.model?.();
+    if (model) {
+      for (const r of studyByUnit.values()) {
+        const src = model.dataSourceForId(r.sourceId);
+        if (src) { try { model.removeSource(src); } catch (_) {} }
+      }
+    }
+    studyByUnit.clear();
+    studiesByMetric.clear();
   }
 
   // Every draw we make carries a linkKey with our prefix. On teardown we

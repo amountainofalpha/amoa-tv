@@ -12,8 +12,14 @@ const CLIENT_NAME = 'AMOA TradingView Overlay';
 // `insertStudy({type: 'pine', pineId, pineVersion}, [])`. Replace pineId
 // with a PUB;<hash> value once the script is published; version stays 5.0
 // unless the script itself is rewritten in Pine v6+.
+// Left-axis study: percent / ratio / count / days / signed non-price metrics.
 const AMOA_PINE_ID = 'USER;91ba7cf3139447a3b3fb0930e49271e8';
-const AMOA_PINE_VERSION = '5.0';
+const AMOA_PINE_VERSION = 'last';
+// Right-axis study: strike prices on the OHLC axis. Paired strike +
+// expiration metrics render as bar-by-bar strike values here so TV
+// renders them as horizontal price lines that align with the candles.
+const AMOA_OHLC_PINE_ID = 'USER;4188b047d90c4ee3b626a7b16a5a4d48';
+const AMOA_OHLC_PINE_VERSION = 'last';
 
 // Depth = every snapshot date the user's tier grants (via available_snapshots).
 // MCP ticker_metrics is capped at 10 dates and 30 stats per call, so we batch.

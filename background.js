@@ -3,7 +3,17 @@ importScripts('config.js');
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   const handler = HANDLERS[msg?.type];
   if (!handler) return false;
-  handler(msg).then(sendResponse);
+  // Wrap both success + failure so we always attempt to close the channel,
+  // and swallow "message channel closed" errors that fire when the sender
+  // (tab / content script) has gone away by the time we resolve.
+  Promise.resolve()
+    .then(() => handler(msg))
+    .then((result) => {
+      try { sendResponse(result); } catch (_) {}
+    })
+    .catch((e) => {
+      try { sendResponse({ ok: false, error: String(e?.message || e) }); } catch (_) {}
+    });
   return true;
 });
 

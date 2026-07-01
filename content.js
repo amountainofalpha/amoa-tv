@@ -35,6 +35,18 @@ function postToPage(payload) {
   window.postMessage({ tag: PAGE_TAG, dir: 'bg->page', ...payload }, '*');
 }
 
+// Thin wrapper around chrome.runtime.sendMessage that swallows the
+// "message channel closed" rejection that fires when the background
+// service worker is restarting mid-flight. Returns null on that failure
+// so callers can no-op cleanly instead of propagating an unhandled promise.
+async function bgSend(msg) {
+  try { return await chrome.runtime.sendMessage(msg); }
+  catch (e) {
+    log('bg message failed', msg?.type, e?.message || e);
+    return null;
+  }
+}
+
 // ── init ─────────────────────────────────────────────────────────────────
 buildPanel();
 installKeyboardShield();
@@ -47,7 +59,7 @@ loadInitialState();
 setInterval(() => { mountPanel(); }, 500);
 
 async function loadInitialState() {
-  const ov = await chrome.runtime.sendMessage({ type: 'getOverlays' });
+  const ov = await bgSend({ type: 'getOverlays' });
   overlays = ov?.overlays || [];
   renderChips();
   // catalog is fetched lazily on first search input to save an initial RTT
@@ -204,7 +216,7 @@ function onOutsideClick(e) {
 
 async function onFocus() {
   if (!catalog) {
-    const r = await chrome.runtime.sendMessage({ type: 'fetchCatalog' });
+    const r = await bgSend({ type: 'fetchCatalog' });
     if (r?.ok) catalog = r.catalog;
     else log('catalog fetch failed', r?.error);
   }
@@ -278,14 +290,16 @@ function updateFiltered() {
   const scored = [];
   for (const e of catalog.entries) {
     if (active.has(e.stat)) continue;
-    const hay = (e.stat + ' ' + e.description + ' ' + e.group).toLowerCase();
     let all = true, score = 0;
     for (const t of tokens) {
-      const inStat = e.stat.toLowerCase().includes(t);
+      const inLabel = (e.label || '').toLowerCase().includes(t);
+      const inStat  = e.stat.toLowerCase().includes(t);
       const inGroup = e.group.toLowerCase().includes(t);
-      const inDesc = e.description.toLowerCase().includes(t);
-      if (!inStat && !inGroup && !inDesc) { all = false; break; }
-      score += inStat ? 100 : inGroup ? 10 : 1;
+      const inDesc  = (e.description || '').toLowerCase().includes(t);
+      if (!inLabel && !inStat && !inGroup && !inDesc) { all = false; break; }
+      // Label matches rank highest since that's what users read; stat and
+      // group tokens are tie-breakers; description matches are last.
+      score += inLabel ? 200 : inStat ? 100 : inGroup ? 10 : 1;
     }
     if (!all) continue;
     scored.push({ e, score });
@@ -327,8 +341,12 @@ function renderRows() {
     row.addEventListener('mousedown', (ev) => { ev.preventDefault(); pickMetric(e); });
 
     const name = document.createElement('span');
-    name.textContent = e.stat;
-    name.style.cssText = 'font-family: ui-monospace, monospace; color: rgb(228, 228, 231); flex-shrink: 0;';
+    // Prefer the catalog's human-readable label; fall back to the raw stat
+    // name only if no label exists. Show the underscore stat as a tooltip
+    // so it's still discoverable for copy-paste.
+    name.textContent = e.label || e.stat;
+    name.title = e.stat;
+    name.style.cssText = 'color: rgb(228, 228, 231); flex-shrink: 0;';
     row.appendChild(name);
 
     const group = document.createElement('span');
@@ -357,7 +375,7 @@ async function pickMetric(entry) {
   if (!entry) return;
   // pairedExpiration comes pre-resolved from the catalog builder — no need
   // to re-detect it here.
-  const r = await chrome.runtime.sendMessage({
+  const r = await bgSend({
     type: 'addOverlay',
     metric: entry.stat,
     label: entry.label || entry.stat,
@@ -471,7 +489,7 @@ function renderActiveMenu() {
 }
 
 async function removeOverlay(metric) {
-  const r = await chrome.runtime.sendMessage({ type: 'removeOverlay', metric });
+  const r = await bgSend({ type: 'removeOverlay', metric });
   overlays = r?.overlays || overlays;
   renderChips();
   postToPage({ type: 'clearMetric', metric });
@@ -483,7 +501,7 @@ async function drawOverlay(metric) {
   if (!overlay) return;
   const targetSymbol = currentSymbol;
   startLoading();
-  const r = await chrome.runtime.sendMessage({
+  const r = await bgSend({
     type: 'fetchHistory',
     ticker: targetSymbol,
     metrics: [metric],
@@ -513,7 +531,7 @@ async function refreshOverlaysForSymbol() {
   if (!overlays.length || !targetSymbol) return;
   const metrics = overlays.map(o => o.metric);
   startLoading();
-  const r = await chrome.runtime.sendMessage({
+  const r = await bgSend({
     type: 'fetchHistory',
     ticker: targetSymbol,
     metrics,
