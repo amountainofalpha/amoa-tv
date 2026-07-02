@@ -12,6 +12,7 @@ Chrome extension that overlays [A Mountain Of Alpha](https://www.amountainofalph
 2. Open `chrome://extensions` (or `brave://extensions`) and enable **Developer mode** in the top-right corner.
 3. **Drag and drop the `.zip` file** anywhere onto the extensions page. Brave / Chrome unpacks and installs it in place.
 4. Pin the extension so the popup is one click away.
+5. **⚠️ Important — reload any TradingView tabs you already had open.** Chrome doesn't inject extensions into pre-existing tabs, so the overlay panel and Pine-script auto-detection won't work on those tabs until you refresh them.
 
 <sub>If drag-and-drop doesn't take, unzip the file manually, then click **Load unpacked** and pick the unzipped folder.</sub>
 
