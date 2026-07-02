@@ -2,7 +2,7 @@
 
 Chrome extension that overlays [A Mountain Of Alpha](https://www.amountainofalpha.com) option-flow metrics directly onto your TradingView charts — peak-strike dots on the price axis, delta / gamma / notional lines on a left-axis study.
 
-![Chart with overlays](docs/metrics.png)
+![Chart with overlays](docs/overlay.png)
 
 ---
 
@@ -33,29 +33,19 @@ After you authorize, the popup shows a green ● **Signed in** and the **Setup**
 
 The extension renders non-price metrics (percent, ratio, days, notional dollars) via two Pine indicators that live on your chart. You add them **once**; the extension auto-detects their IDs the moment they're on any chart and remembers them forever.
 
-Overall you'll do this exact flow twice — once for `AMOA`, once for `AMOA OHLC`.
-
-### 1. Open the Pine Editor
-
 Open any chart at [tradingview.com/chart](https://www.tradingview.com/chart/) and click the **Pine Editor** tab at the bottom of the screen.
 
 ![Pine Editor tab](docs/pine_editor_icon.png)
 
-### 2. Create a new indicator
+### 1. Create a new indicator
 
-In the Pine Editor's toolbar, click the ⋯ (or "Open") menu → **New** → **Blank indicator script**.
+In the Pine Editor's toolbar, click the ⋯ menu → **New** → **Blank indicator script**.
 
 ![Create new indicator](docs/create_new_indicator.png)
 
-If TradingView asks whether to open a copy of an existing script, choose **Make a copy** so you don't overwrite anything you already had.
+### 2. Paste the AMOA script
 
-![Make a copy](docs/make_a_copy.png)
-
-### 3. Paste the source and save
-
-Replace the editor contents with the code below.
-
-**AMOA** (left-axis study — hosts delta, gamma, notional, percentages, days, counts):
+Replace the editor's contents with:
 
 ```pine
 //@version=6
@@ -67,7 +57,37 @@ plot(na, 'data 3')
 plot(na, 'data 3')
 ```
 
-**AMOA OHLC** (right-axis study — hosts paired-strike dot trails aligned with candles):
+![Pasting into the editor](docs/setting_up_scripts.png)
+
+### 3. Save (`⌘S` / `Ctrl+S`)
+
+Hit the save shortcut — or click **Save** in the toolbar.
+
+### 4. Name it `AMOA`
+
+TradingView opens a title dialog. Name it exactly **`AMOA`** and confirm.
+
+![Save dialog](docs/save_script.png)
+
+### 5. Add to chart
+
+Click **Add to chart** in the Pine Editor toolbar.
+
+![Add to chart](docs/add_to_chart.png)
+
+The indicator's name appears in the top-left of the chart legend — that's your confirmation it's attached. Within a second, the popup's step 1 turns green.
+
+![Indicator on chart](docs/validate_add_to_chart.png)
+
+### 6. Make a copy for the second indicator
+
+Now you'll build the OHLC script by cloning the one you just made. In the Pine Editor, click **Make a copy**.
+
+![Make a copy](docs/make_a_copy.png)
+
+### 7. Paste the AMOA OHLC script
+
+Replace the copied contents with:
 
 ```pine
 //@version=6
@@ -79,25 +99,9 @@ plot(na, 'data 3')
 plot(na, 'data 3')
 ```
 
-![Pasting into the editor](docs/setting_up_scripts.png)
+Save it (`⌘S` / `Ctrl+S`), name it exactly **`AMOA OHLC`**, then click **Add to chart** again.
 
-Save the indicator — either hit `⌘S` / `Ctrl+S` or click **Save** in the toolbar. TradingView asks for a title; use the exact name that matches the script — `AMOA` for the first, `AMOA OHLC` for the second.
-
-![Saving the script](docs/save_script.png)
-
-### 4. Add to chart
-
-Click **Add to chart** in the Pine Editor toolbar.
-
-![Add to chart](docs/add_to_chart.png)
-
-You'll see the indicator's name appear in the top-left of the chart's legend — confirmation that it's attached.
-
-![Indicator on chart](docs/validate_add_to_chart.png)
-
-Within about a second, the extension detects the script's Pine ID and the corresponding step in the popup turns green.
-
-**Repeat steps 2–4 for the second script.** Once both are added, the Setup section collapses and the popup shows a green **Ready** banner:
+Once both indicators are on your chart the extension detects them, the Setup section collapses, and the popup shows a green **Ready** banner:
 
 ![Setup complete](docs/completed.png)
 
