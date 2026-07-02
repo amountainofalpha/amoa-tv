@@ -18,6 +18,56 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 // ============================================================================
+// Update check: poll the repo's GitHub releases for a newer version tag.
+// Releases must be tagged v<version> matching manifest.json (build.sh names
+// the zip from the same field). api.github.com serves CORS `*`, so no host
+// permission is needed. Cached 6h; the popup forces a read on open and a
+// startup check keeps the icon badge fresh even if the popup stays closed.
+// ============================================================================
+
+const RELEASES_API  = 'https://api.github.com/repos/amountainofalpha/amoa-tv/releases/latest';
+const UPDATE_CHECK_TTL_MS = 6 * 60 * 60 * 1000;
+
+async function handleCheckUpdate() {
+  const now = Date.now();
+  const { updateCheck = {} } = await chrome.storage.local.get('updateCheck');
+  let latest = updateCheck.latest || null;
+  if (!updateCheck.checkedAt || now - updateCheck.checkedAt >= UPDATE_CHECK_TTL_MS) {
+    try {
+      const res = await fetch(RELEASES_API, { headers: { accept: 'application/vnd.github+json' } });
+      if (!res.ok) throw new Error('GitHub API ' + res.status);
+      const body = await res.json();
+      latest = String(body?.tag_name || '').replace(/^v/i, '') || null;
+      await chrome.storage.local.set({ updateCheck: { checkedAt: now, latest } });
+    } catch (e) {
+      // Keep whatever we knew before; retry after TTL.
+      await chrome.storage.local.set({ updateCheck: { checkedAt: now, latest } });
+    }
+  }
+  const current = chrome.runtime.getManifest().version;
+  const updateAvailable = !!latest && compareVersions(latest, current) > 0;
+  try {
+    chrome.action.setBadgeText({ text: updateAvailable ? 'NEW' : '' });
+    if (updateAvailable) chrome.action.setBadgeBackgroundColor({ color: '#f59e0b' });
+  } catch (_) {}
+  return { ok: true, current, latest, updateAvailable };
+}
+
+// Dotted-numeric compare: 0.2.0 > 0.1.9, tolerates different lengths.
+function compareVersions(a, b) {
+  const pa = String(a).split('.').map(Number);
+  const pb = String(b).split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
+// Refresh the badge whenever the service worker spins up (throttled by TTL).
+handleCheckUpdate().catch(() => {});
+
+// ============================================================================
 // Auth: OAuth 2.1 + PKCE against amoa's MCP server.
 // ============================================================================
 
@@ -418,6 +468,9 @@ async function handleGetOverlays() {
   const seen = new Set();
   let recolored = false;
   for (const o of overlays) {
+    // User-picked colors always win — never remap them, even if two
+    // overlays end up the same shade on purpose.
+    if (o.customColor && o.color) { seen.add(o.color); continue; }
     if (o.color && !seen.has(o.color)) { seen.add(o.color); continue; }
     const next = COLOR_PALETTE.find(c => !seen.has(c))
               || COLOR_PALETTE[seen.size % COLOR_PALETTE.length];
@@ -473,6 +526,21 @@ async function handleRemoveOverlay({ metric }) {
     const next = overlays.filter(o => o.metric !== metric);
     await chrome.storage.local.set({ overlays: next });
     return { ok: true, overlays: next };
+  });
+}
+
+// User recolored a plot via TV's study settings dialog — persist the
+// choice so future draws keep it. customColor marks it user-picked so
+// the duplicate-color repair in handleGetOverlays never remaps it.
+async function handleSetOverlayColor({ metric, color }) {
+  return withOverlaysLock(async () => {
+    const { overlays = [] } = await chrome.storage.local.get('overlays');
+    const o = overlays.find(x => x.metric === metric);
+    if (!o) return { ok: true, overlays };
+    o.color = color;
+    o.customColor = true;
+    await chrome.storage.local.set({ overlays });
+    return { ok: true, overlays };
   });
 }
 
@@ -556,6 +624,8 @@ const HANDLERS = {
   addOverlay:     handleAddOverlay,
   removeOverlay:  handleRemoveOverlay,
   toggleOverlay:  handleToggleOverlay,
+  setOverlayColor: handleSetOverlayColor,
+  checkUpdate:    handleCheckUpdate,
   getAuthState:   handleGetAuthState,
   getPineIds:     handleGetPineIds,
   setPineId:      handleSetPineId,

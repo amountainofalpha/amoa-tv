@@ -20,6 +20,7 @@ let loadingCount = 0; // active fetches — spinner shown while > 0
 let signedIn = false; // gates panel mount + all fetching / drawing
 let pineIds = { overlay: null, ohlc: null }; // per-user Pine hashes
 let setupComplete = false; // signedIn && both pineIds set
+let settings = { excludeOutliers: true }; // user prefs from the popup
 
 // ── page ↔ content bridge ─────────────────────────────────────────────────
 window.addEventListener('message', (ev) => {
@@ -44,6 +45,12 @@ window.addEventListener('message', (ev) => {
     // icon matches.
     applyPlotVisibility(msg.metric, msg.visible);
   }
+  if (msg.type === 'plotColorChanged') {
+    // User recolored a specific plot in the AMOA study via TV's settings
+    // dialog — persist the pick so redraws keep it and the panel's color
+    // dot matches.
+    applyPlotColor(msg.metric, msg.color);
+  }
   if (msg.type === 'studyRemoved') {
     // User deleted an AMOA / AMOA OHLC study from the chart entirely.
     // Purge every overlay that was hosted in it so the extension's list
@@ -56,6 +63,15 @@ async function applyStudyRemoved(metrics) {
   if (!metrics.length) return;
   for (const m of metrics) await bgSend({ type: 'removeOverlay', metric: m });
   const r = await bgSend({ type: 'getOverlays' });
+  overlays = r?.overlays || overlays;
+  renderChips();
+}
+
+async function applyPlotColor(metric, color) {
+  const o = overlays.find(x => x.metric === metric);
+  if (!o) return;
+  if (o.color === color) return; // already in sync
+  const r = await bgSend({ type: 'setOverlayColor', metric, color });
   overlays = r?.overlays || overlays;
   renderChips();
 }
@@ -82,6 +98,18 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.type === 'authChanged') { signedIn = !!msg.signedIn; applyState(); }
   if (msg?.type === 'pineIdsChanged') { pineIds = msg.pineIds || pineIds; applyState(); }
 });
+
+// Settings live in chrome.storage and are edited from the popup — pick up
+// changes live and redraw so a toggle (e.g. outlier exclusion) applies
+// without a page reload.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !changes.settings) return;
+  settings = { ...settings, ...(changes.settings.newValue || {}) };
+  if (setupComplete) refreshOverlaysForSymbol();
+});
+chrome.storage.local.get('settings').then(({ settings: s }) => {
+  settings = { ...settings, ...(s || {}) };
+}).catch(() => {});
 
 function postToPage(payload) {
   window.postMessage({ tag: PAGE_TAG, dir: 'bg->page', ...payload }, '*');
@@ -730,6 +758,7 @@ async function drawOverlay(metric) {
     label: overlay.label || overlay.metric,
     points,
     hiddenMetrics: overlays.filter(o => o.hidden).map(o => o.metric),
+    excludeOutliers: settings.excludeOutliers !== false,
   });
   postToPage({ type: 'pruneUnusedStudies' });
 }
@@ -766,6 +795,7 @@ async function refreshOverlaysForSymbol() {
       label: o.label || o.metric,
       points,
       hiddenMetrics,
+      excludeOutliers: settings.excludeOutliers !== false,
     });
   }
   postToPage({ type: 'pruneUnusedStudies' });

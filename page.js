@@ -80,6 +80,10 @@
   const studyInsertInFlight = new Map(); // unit → Promise<sourceId|null>
   let currentSymbol = null;
   let debounceTimer = null;
+  // First bar index of the main series as of the last watcher tick — when
+  // it decreases, TV lazy-loaded older candles (zoom/scroll-out) and our
+  // studies need a re-push so full-history points map onto the new bars.
+  let histFirstIndex = null;
   // Serial queue for drawSeries calls — ensures per-unit study insert
   // dedup works even when multiple metrics fire back-to-back.
   let drawSeriesQueue = Promise.resolve();
@@ -94,8 +98,7 @@
   // Only runs while the corresponding pineId is unset — once configured we
   // don't overwrite (user's Setup → Reset in the popup clears it).
   setInterval(() => {
-    const w = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.();
-    const model = w?.model?.();
+    const model = activeModel();
     if (!model) return;
     for (const s of (model.dataSources?.() || [])) {
       if (!s || s.isLineTool) continue;
@@ -156,6 +159,15 @@
     } catch (_) {}
   }
 
+  // The active chart's model, or null. w.model() THROWS ("Value is null")
+  // while the chart is still loading — a truthy `w.model` method is not
+  // enough to know the chart is ready.
+  function activeModel() {
+    try {
+      return window._exposed_chartWidgetCollection?.activeChartWidget?.value?.()?.model?.() || null;
+    } catch (_) { return null; }
+  }
+
   function waitForChart() {
     return new Promise((resolve) => {
       let tries = 0;
@@ -163,7 +175,9 @@
         tries++;
         const c = window._exposed_chartWidgetCollection;
         const w = c?.activeChartWidget?.value?.();
-        if (w && w.model) resolve({ c, w });
+        // Only resolve once model() actually returns a model — it throws
+        // during the load phase even though the widget object exists.
+        if (w && activeModel()) resolve({ c, w });
         else setTimeout(check, 300);
       };
       check();
@@ -187,6 +201,7 @@
     log('symbol changed →', newSymbol);
     clearAllOverlays();
     currentSymbol = newSymbol;
+    histFirstIndex = null; // new symbol → new series indexing
     window.postMessage({ tag: PAGE_TAG, dir: 'page->bg', type: 'symbolChanged', symbol: newSymbol }, '*');
   }
 
@@ -215,7 +230,7 @@
       // studiesByUnit before the second one asks for it. Simpler than
       // per-unit in-flight dedup and cheaper than a batching protocol.
       drawSeriesQueue = drawSeriesQueue.then(() => drawSeries(
-        msg.metric, msg.color, msg.points, msg.isStrike, msg.label, msg.symbol, msg.unit, msg.hiddenMetrics
+        msg.metric, msg.color, msg.points, msg.isStrike, msg.label, msg.symbol, msg.unit, msg.hiddenMetrics, msg.excludeOutliers
       )).catch((e) => log('drawSeries error', e?.message || e));
       return;
     }
@@ -235,7 +250,7 @@
   // initial setup (once we've captured their hashes and started using
   // one) and leftover empties from removed metrics.
   function pruneUnusedStudies() {
-    const model = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.()?.model?.();
+    const model = activeModel();
     if (!model) return;
     const claimed = new Set([...studyByUnit.values()].map(r => r.sourceId));
     const knownHashes = Object.values(STUDY_KINDS)
@@ -256,7 +271,7 @@
   }
 
   // ── drawing ──────────────────────────────────────────────────────────────
-  async function drawSeries(metric, color, points, isStrike, label, symbolAtDispatch, unit, hiddenMetrics) {
+  async function drawSeries(metric, color, points, isStrike, label, symbolAtDispatch, unit, hiddenMetrics, excludeOutliers) {
     if (!points?.length) { log('no points for', metric); return; }
     const stillCurrent = () => currentSymbol === symbolAtDispatch;
     if (!stillCurrent()) { log('symbol drifted before draw for', metric); return; }
@@ -269,11 +284,19 @@
     const pane = model.panes()[0];
     const ts = model.timeScale();
 
+    // Price-axis data (strikes + bare-usd series) shares TV's auto-fit
+    // scale with the candles — one bogus print far above spot squashes the
+    // whole chart. Study-hosted data is filtered at push time (so the band
+    // follows the loaded candle range as history extends); line tools are
+    // filtered here at draw time. Controlled by the "Exclude outlier
+    // points" popup setting (default on).
+    const wantsOutlierFilter = excludeOutliers !== false && (isStrike || (unit && PRICE_UNITS.has(unit)));
+
     // Non-price metrics (percent / ratio / count / days / …) can't share
     // the OHLC scale — their values are on a totally different range. Push
     // them into a hijacked study which comes with its own left-hand axis.
     if (!isStrike && unit && !PRICE_UNITS.has(unit)) {
-      await drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent, unit, kind: 'overlay', hiddenMetrics });
+      await drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent, unit, kind: 'overlay', hiddenMetrics, excludeOutliers: false });
       return;
     }
 
@@ -292,8 +315,16 @@
         w, model, metric, label, color,
         points: expanded, ts, stillCurrent,
         unit: OHLC_UNIT_KEY, kind: 'ohlc', hiddenMetrics,
+        excludeOutliers: wantsOutlierFilter,
       });
       return;
+    }
+
+    // Line-tool renderers are one-shot (no retained data to re-push), so
+    // filter at draw time.
+    if (wantsOutlierFilter) {
+      points = filterPriceOutliers(points, metric, model);
+      if (!points.length) { log('all points were outliers for', metric); return; }
     }
 
     const mapped = [];
@@ -372,6 +403,55 @@
     props.linewidth?.setValue?.(0);
     // Hide interactive-selection labels/handles for cleaner overlays.
     props.showLabel?.setValue?.(false);
+  }
+
+  // Outlier band: current price sets the ceiling, the view sets the floor.
+  //   • above: up to 50% over the current price, or the highest visible
+  //     close (small pad) if that's higher — a stock 80% off its highs
+  //     still shows old strikes near those highs while they're on screen.
+  //   • below: 20% under the LOWEST visible close. A 4,000 print when
+  //     everything in view closed above 6,300 is a bad print no matter
+  //     what fraction of spot it is.
+  // The visibility watcher re-pushes when zoom/pan moves the band.
+  const OUTLIER_ABOVE = 1.5;  // ceiling: × current price
+  const OUTLIER_BELOW = 0.8;  // floor:   × lowest visible close
+  const VIEW_PAD = 1.05;      // pad on the highest visible close
+  function outlierBand(model) {
+    try {
+      const ts = model?.timeScale?.();
+      const bars = model?.mainSeries?.()?.bars?.();
+      if (!ts || !bars) return null;
+      const bFirst = bars.firstIndex(), bLast = bars.lastIndex();
+      const vr = ts.visibleBarsStrictRange?.();
+      // Clamp the visible window to bars that actually exist (the right
+      // margin extends past the last bar; null range during animations).
+      let first = vr?.firstBar?.(), last = vr?.lastBar?.();
+      first = Number.isFinite(first) ? Math.max(first, bFirst) : bFirst;
+      last  = Number.isFinite(last)  ? Math.min(last, bLast)   : bLast;
+      if (!(last >= first)) return null;
+      const mm = bars.minMaxOnRangeCached(first, last, [{ name: 'close', offset: 0 }]);
+      if (!mm || !Number.isFinite(mm.min) || !Number.isFinite(mm.max) || mm.max <= 0) return null;
+      // Current price = last close of the series (not just the view).
+      const lastClose = Number(bars.last?.()?.value?.[4]);
+      const px = Number.isFinite(lastClose) && lastClose > 0 ? lastClose : mm.max;
+      return {
+        lo: mm.min * OUTLIER_BELOW,
+        hi: Math.max(px * OUTLIER_ABOVE, mm.max * VIEW_PAD),
+      };
+    } catch (_) { return null; }
+  }
+
+  function filterPriceOutliers(points, metric, model) {
+    const band = outlierBand(model);
+    if (!band) return points;
+    const kept = points.filter(p =>
+      !Number.isFinite(p.value) || (p.value >= band.lo && p.value <= band.hi));
+    const dropped = points.length - kept.length;
+    if (dropped) {
+      log('excluded', dropped, 'outlier point(s) for', metric,
+          '— outside view band [' + band.lo.toFixed(2) + ', ' + band.hi.toFixed(2) + ']');
+    }
+    return kept;
   }
 
   // Turn paired strike + expiration observations into a bar-by-bar
@@ -492,7 +572,7 @@
   // separate left-hand price scale that auto-fits its data range. We then
   // overwrite its computed values with ours so the axis lands where the
   // user's metric actually lives — no normalization, no shared price scale.
-  async function drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent, unit, kind, hiddenMetrics }) {
+  async function drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent, unit, kind, hiddenMetrics, excludeOutliers }) {
     const record = await ensureAmoaStudyRecord({ w, model, metric, unit, kind, label, color, stillCurrent });
     if (!record) {
       log('no AMOA Overlay study available for', metric,
@@ -507,6 +587,7 @@
       return;
     }
     record.dataByMetric.set(metric, points);
+    record.excludeOutliers = !!excludeOutliers;
     const added = pushCombinedDataToStudy(src, record, ts);
     log('pushed', added, 'combined points to AMOA', unit, 'study — metric', metric,
         'in slot', record.slotByMetric.get(metric),
@@ -591,6 +672,7 @@
     const [oldestMetric, oldestSlot] = record.slotByMetric.entries().next().value;
     record.slotByMetric.delete(oldestMetric);
     record.dataByMetric.delete(oldestMetric);
+    record._appliedColor?.delete?.(oldestMetric);
     record.slotByMetric.set(metric, oldestSlot);
     log('AMOA', 'unit slots full — evicted', oldestMetric, 'for', metric);
     return oldestSlot;
@@ -762,6 +844,50 @@
   function installVisibilityGuard(model, record) {
     if (visibilityWatcher) return; // one shared poll covers every study
     visibilityWatcher = setInterval(() => {
+      // History-extension sync — TV lazy-loads older candles on zoom/
+      // scroll-out. Points whose times mapped off-chart when we pushed
+      // become mappable, so re-push every study. This also re-anchors the
+      // outlier band on the now-wider candle range.
+      try {
+        const firstIdxNow = model.mainSeries?.()?.bars?.()?.firstIndex?.();
+        if (Number.isFinite(firstIdxNow) && firstIdxNow !== histFirstIndex) {
+          const extended = histFirstIndex != null && firstIdxNow < histFirstIndex;
+          histFirstIndex = firstIdxNow;
+          if (extended) {
+            const ts = model.timeScale?.();
+            for (const r of studyByUnit.values()) {
+              const src = model.dataSourceForId(r.sourceId);
+              if (!src || !ts || !r.dataByMetric.size) continue;
+              const n = pushCombinedDataToStudy(src, r, ts);
+              wakePlotRenderers(model, src, r);
+              log('history extended — re-pushed', n, 'points to AMOA', r.unit);
+            }
+          }
+        }
+      } catch (_) {}
+
+      // View-anchored outlier re-filter — zoom/pan moves the highest and
+      // lowest visible close, so the band shifts and points near its edge
+      // should appear/disappear. Re-push when it moved meaningfully.
+      try {
+        for (const r of studyByUnit.values()) {
+          if (r.kind !== 'ohlc' || !r.excludeOutliers || !r.dataByMetric.size) continue;
+          const src = model.dataSourceForId(r.sourceId);
+          if (!src) continue;
+          const band = outlierBand(model);
+          if (!band) continue;
+          const prev = r._lastBand;
+          const moved = !prev
+            || Math.abs(band.lo - prev.lo) > Math.abs(prev.lo) * 0.001
+            || Math.abs(band.hi - prev.hi) > Math.abs(prev.hi) * 0.001;
+          if (!moved) continue;
+          const tsNow = model.timeScale?.();
+          if (!tsNow) continue;
+          pushCombinedDataToStudy(src, r, tsNow);
+          wakePlotRenderers(model, src, r);
+        }
+      } catch (_) {}
+
       // User-deleted study detection: if a claimed source no longer
       // resolves, the user removed it from the chart (right-click →
       // Remove on the AMOA legend entry, or removed the whole pane).
@@ -812,6 +938,21 @@
             }, '*');
           }
           r._prevPlotVisible.set(metric, effectiveVisible);
+
+          // Color sync — if the user recolored this plot via TV's study
+          // settings dialog, persist the pick so redraws keep it instead
+          // of stomping back to the palette color. _appliedColor tracks
+          // what WE last wrote (applyAmoaSlotStyling), so any drift means
+          // the user changed it.
+          const observedColor = plotChilds?.color?.value?.();
+          const appliedColor = r._appliedColor?.get(metric);
+          if (observedColor && appliedColor && observedColor !== appliedColor) {
+            r._appliedColor.set(metric, observedColor);
+            window.postMessage({
+              tag: PAGE_TAG, dir: 'page->bg',
+              type: 'plotColorChanged', metric, color: observedColor,
+            }, '*');
+          }
         }
 
         // Data-cleared recovery (existing) — TV wipes the SortedMap on
@@ -822,10 +963,34 @@
           const ts = model.timeScale?.();
           if (!ts) continue;
           const n = pushCombinedDataToStudy(src, r, ts);
+          wakePlotRenderers(model, src, r);
           log('re-pushed', n, 'points to AMOA', r.unit, 'after data cleared');
         }
       }
     }, 500);
+  }
+
+  // Kick TV's plot renderers into repainting a study whose data changed
+  // underneath them. The Circles renderer caches painted dots and ignores
+  // rows prepended by a history-extension re-push; the display-bitmask
+  // dance (0 → show-everywhere) forces it to rebuild — same trick as
+  // applyAmoaSlotStyling. Slots the user hid (display 0) stay hidden.
+  // Both steps are synchronous, so the visibility watcher never sees the
+  // transient 0. Follow with the model-level updateSource invalidation so
+  // the pane repaints the extended region.
+  function wakePlotRenderers(model, src, record) {
+    const styles = src._properties?.styles;
+    const sc = typeof styles?.childs === 'function' ? styles.childs() : styles;
+    for (const slot of record.slotByMetric.values()) {
+      const plot = sc?.[`plot_${slot}`];
+      const pc = typeof plot?.childs === 'function' ? plot.childs() : plot;
+      if (pc?.display?.value?.() === 0) continue; // hidden — leave it
+      try {
+        pc?.display?.setValue?.(0);
+        pc?.display?.setValue?.(0xFFFFFFFF);
+      } catch (_) {}
+    }
+    try { model.m_model?.updateSource?.(src); } catch (_) {}
   }
 
   function pushCombinedDataToStudy(src, record, ts) {
@@ -833,10 +998,33 @@
     const byTime = new Map();
     const width = 1 + record.numSlots;
     const wantsZeroLine = SIGNED_UNITS.has(record.unit) && record.zeroSlot != null;
+    // Outlier band for price-axis (ohlc-kind) studies, recomputed on every
+    // push so it tracks the currently-loaded candle range (zooming out
+    // loads more history and widens the anchor).
+    // Outlier band for price-axis (ohlc-kind) studies — anchored to the
+    // closes in view, re-evaluated on every push so it follows zoom/pan
+    // and history loads. Remembered on the record so the watcher can
+    // detect when the view moved enough to need a re-filter.
+    const mainBars = activeModel()?.mainSeries?.()?.bars?.();
+    const band = record.kind === 'ohlc' && record.excludeOutliers
+      ? outlierBand(activeModel()) : null;
+    record._lastBand = band;
+    // timePointToIndex CLAMPS times older than the first loaded bar onto
+    // that bar's index — dozens of pre-history points would pile up on the
+    // leftmost bar, overwriting each other with wrong data. Skip them;
+    // the history-extension re-push maps them once their bars load.
+    let minTime = -Infinity;
+    try {
+      const firstBar = mainBars?.first?.();
+      if (Number.isFinite(firstBar?.value?.[0])) minTime = firstBar.value[0];
+    } catch (_) {}
+    let outliers = 0, preHistory = 0;
     for (const [metric, points] of record.dataByMetric.entries()) {
       const slot = record.slotByMetric.get(metric);
       if (slot == null) continue;
       for (const p of points) {
+        if (p.time < minTime) { preHistory++; continue; }
+        if (band && Number.isFinite(p.value) && (p.value < band.lo || p.value > band.hi)) { outliers++; continue; }
         let row = byTime.get(p.time);
         if (!row) {
           row = new Array(width).fill(null);
@@ -863,6 +1051,14 @@
       if (data.add(idx, row) !== false) added++;
     }
     data._shareRead = true;
+    if (outliers) {
+      log('excluded', outliers, 'outlier point(s) from AMOA', record.unit,
+          'study — outside view band [' + band.lo.toFixed(2) + ', ' + band.hi.toFixed(2) + ']');
+    }
+    if (preHistory) {
+      log('deferred', preHistory, 'point(s) older than the loaded candles for AMOA', record.unit,
+          '— they map in as more history loads');
+    }
     try { src._invalidateLastNonEmptyPlotRowCache?.(); } catch (_) {}
     // Force TV's study-view pipeline to re-render from the mutated data.
     // Without this, clear+re-add on the SortedMap changes the data but
@@ -886,6 +1082,10 @@
     const styles = src._properties?.styles;
     const plotProps = styles?.[plotId] || styles?.childs?.()?.[plotId];
     try { plotProps?.color?.setValue?.(color); } catch (_) {}
+    // Remember what we wrote so the visibility watcher can tell our own
+    // writes apart from a user recolor in TV's settings dialog.
+    if (!record._appliedColor) record._appliedColor = new Map();
+    record._appliedColor.set(metric, color);
     // Force the plot renderer to re-initialize by dancing the display
     // bitmask: 0 (hide) → 0xFFFFFFFF (show everywhere). A single transition
     // from a previously-hidden state doesn't reliably wake up the OHLC
@@ -935,12 +1135,13 @@
     const freedSlot = ownerRecord.slotByMetric.get(metric);
     ownerRecord.slotByMetric.delete(metric);
     ownerRecord.dataByMetric.delete(metric);
-    // Drop the visibility-watcher's cache entry too so a later slot re-claim
-    // doesn't fire a spurious plotVisibilityChanged when applyAmoaSlotStyling
-    // resets display back to shown.
+    // Drop the visibility-watcher's cache entries too so a later slot
+    // re-claim doesn't fire a spurious plotVisibilityChanged /
+    // plotColorChanged when applyAmoaSlotStyling resets the plot.
     ownerRecord._prevPlotVisible?.delete?.(metric);
+    ownerRecord._appliedColor?.delete?.(metric);
     // Re-push so the removed metric's line disappears immediately.
-    const model = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.()?.model?.();
+    const model = activeModel();
     if (model) {
       const src = model.dataSourceForId(id);
       const ts = model.timeScale?.();
@@ -968,7 +1169,7 @@
   }
 
   function removeAllHijackStudies() {
-    const model = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.()?.model?.();
+    const model = activeModel();
     if (model) {
       for (const r of studyByUnit.values()) {
         const src = model.dataSourceForId(r.sourceId);
@@ -984,7 +1185,7 @@
   // orphans from a previous tab session (before the in-memory
   // drawingsByMetric map existed) also get nuked, not just what we tracked.
   function sweepByLinkKey(matches) {
-    const model = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.()?.model?.();
+    const model = activeModel();
     if (!model) return 0;
     const sources = model.dataSources?.() || [];
     let removed = 0;

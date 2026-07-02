@@ -10,6 +10,18 @@ const overlayReset  = document.getElementById('overlayReset');
 const ohlcDot       = document.getElementById('ohlcDot');
 const ohlcReset     = document.getElementById('ohlcReset');
 const readyBanner   = document.getElementById('readyBanner');
+const settingsSection = document.getElementById('settingsSection');
+const excludeOutliers = document.getElementById('excludeOutliers');
+const updateBanner    = document.getElementById('updateBanner');
+const updateVersion   = document.getElementById('updateVersion');
+
+// Independent of auth state — surface a newer GitHub release if one exists.
+async function checkForUpdate() {
+  const r = await chrome.runtime.sendMessage({ type: 'checkUpdate' });
+  if (!r?.ok) return;
+  updateBanner.hidden = !r.updateAvailable;
+  if (r.updateAvailable) updateVersion.textContent = 'v' + r.latest;
+}
 
 async function refresh() {
   const state = await chrome.runtime.sendMessage({ type: 'getAuthState' });
@@ -31,6 +43,7 @@ async function refresh() {
     authBtn.dataset.action = 'signIn';
     setupSection.hidden = true;
     readyBanner.hidden = true;
+    settingsSection.hidden = true;
     return;
   }
 
@@ -38,8 +51,14 @@ async function refresh() {
   const complete = !!p.overlay && !!p.ohlc;
   // Hide the whole Setup section (banner + both step rows) once both
   // Pine IDs are configured — user doesn't need onboarding anymore.
+  // Settings only show once fully onboarded (Ready).
   setupSection.hidden = complete;
   readyBanner.hidden = !complete;
+  settingsSection.hidden = !complete;
+  if (complete) {
+    const { settings = {} } = await chrome.storage.local.get('settings');
+    excludeOutliers.value = settings.excludeOutliers === false ? 'no' : 'yes';
+  }
   if (!complete) {
     applyStepState(overlayDot, overlayReset, !!p.overlay);
     applyStepState(ohlcDot,    ohlcReset,    !!p.ohlc);
@@ -79,6 +98,14 @@ overlayReset.addEventListener('click', async () => {
   await chrome.runtime.sendMessage({ type: 'clearPineId', kind: 'overlay' });
   refresh();
 });
+// Persist setting changes — content.js watches chrome.storage and
+// redraws the overlays live, so no reload is needed.
+excludeOutliers.addEventListener('change', async () => {
+  const { settings = {} } = await chrome.storage.local.get('settings');
+  settings.excludeOutliers = excludeOutliers.value === 'yes';
+  await chrome.storage.local.set({ settings });
+});
+
 ohlcReset.addEventListener('click', async () => {
   await chrome.runtime.sendMessage({ type: 'clearPineId', kind: 'ohlc' });
   refresh();
@@ -92,3 +119,4 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 
 refresh();
+checkForUpdate();

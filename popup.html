@@ -29,13 +29,37 @@
   .step { display: flex; justify-content: space-between; align-items: center; margin: 4px 0; }
   .step-name { font-size: 12px; }
   .step-actions { display: inline-flex; align-items: center; gap: 8px; }
-  a.linky { text-decoration: none; }
+  a.linky { text-decoration: none; color: #ffffff; }
+  a.linky:hover { color: #d4d4d8; }
+  .help { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; border-radius: 50%; background: #3f3f46; color: #a1a1aa; font-size: 10px; cursor: help; vertical-align: middle; margin-left: 4px; }
+  .help:hover { background: #52525b; color: #e4e4e7; }
+  /* Native title tooltips are flaky inside extension popups — render our
+     own from data-tip. Shown above the ? so it never clips against the
+     popup's bottom edge (the popup window doesn't grow for abs-positioned
+     content). */
+  .help::after {
+    content: attr(data-tip);
+    position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%);
+    width: 230px; background: #27272a; color: #d4d4d8;
+    border: 1px solid #3f3f46; border-radius: 4px;
+    padding: 8px 10px; font-size: 11px; line-height: 1.45; font-weight: normal;
+    white-space: normal; text-align: left;
+    opacity: 0; visibility: hidden; transition: opacity 0.12s;
+    z-index: 10; pointer-events: none;
+  }
+  .help:hover::after { opacity: 1; visibility: visible; }
   .banner { background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.35); color: #fbbf24; padding: 8px 10px; border-radius: 4px; font-size: 11px; line-height: 1.4; margin: 10px 0; }
   .banner.ok { background: rgba(34, 197, 94, 0.1); border-color: rgba(34, 197, 94, 0.35); color: #86efac; }
+  .banner a { color: inherit; text-decoration: underline; }
 </style>
 </head>
 <body>
   <h1>AMOA TV Overlay</h1>
+
+  <div id="updateBanner" class="banner" hidden>
+    Update available: <b id="updateVersion"></b> —
+    <a href="https://github.com/amountainofalpha/amoa-tv/releases" target="_blank" rel="noopener">get it on GitHub</a>
+  </div>
 
   <div class="row" id="envRow">
     <span>Environment</span>
@@ -79,6 +103,19 @@
 
   <div id="readyBanner" class="banner ok" hidden>
     Ready — open a TradingView chart to use the overlay.
+  </div>
+
+  <div id="settingsSection" hidden>
+    <h2>Settings</h2>
+    <div class="row">
+      <span>Exclude outlier points
+        <span class="help" data-tip="Skips bad prints on price-axis overlays (strikes and dollar levels): anything more than 50% above the current price (or above the highest close in view) and anything more than 20% below the lowest close in view. The band follows your zoom, so one stray print can't stretch the price scale and squash the candles. Choose No to draw every point as-is.">?</span>
+      </span>
+      <select id="excludeOutliers">
+        <option value="yes">Yes</option>
+        <option value="no">No</option>
+      </select>
+    </div>
   </div>
 
   <div class="muted" style="margin-top: 12px;">Overlays load automatically when you open a TradingView chart.</div>
