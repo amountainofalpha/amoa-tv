@@ -25,7 +25,9 @@ Click **Sign in**. A new tab opens for the AMOA OAuth flow — click **Authorize
 
 ![OAuth authorize](docs/click_auth.png)
 
-After you authorize, the popup shows a green ● **Signed in** and the **Setup** section appears — you now have two Pine scripts to add.
+After you authorize, the popup shows a green ● **Signed in** and the **Setup** section appears — the extension is now waiting for you to add the two Pine scripts to your chart:
+
+![Popup waiting for scripts](docs/setting_up_scripts.png)
 
 ---
 
@@ -56,8 +58,6 @@ plot(na, 'data 3')
 plot(na, 'data 3')
 plot(na, 'data 3')
 ```
-
-![Pasting into the editor](docs/setting_up_scripts.png)
 
 ### 3. Save (`⌘S` / `Ctrl+S`)
 
@@ -100,6 +100,8 @@ plot(na, 'data 3')
 ```
 
 Save it (`⌘S` / `Ctrl+S`), name it exactly **`AMOA OHLC`**, then click **Add to chart** again.
+
+![Save AMOA OHLC](docs/save_amoa_ohlc.png)
 
 Once both indicators are on your chart the extension detects them, the Setup section collapses, and the popup shows a green **Ready** banner:
 
