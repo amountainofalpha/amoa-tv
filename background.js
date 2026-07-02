@@ -108,13 +108,28 @@ async function handleSignIn() {
     refresh_token: t.refresh_token,
     expires_at: Date.now() + (Number(t.expires_in || 3600) * 1000) - 30_000,
   });
+  broadcastAuthState(true);
   return { ok: true };
 }
 
 async function handleSignOut() {
   const env = await getEnv();
   await clearAuth(env);
+  broadcastAuthState(false);
   return { ok: true };
+}
+
+// Notify every TradingView chart tab that auth changed so content.js can
+// mount/unmount the panel and clear drawings without waiting for a reload.
+async function broadcastAuthState(signedIn) {
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://www.tradingview.com/chart/*' });
+    for (const t of tabs) {
+      if (t.id == null) continue;
+      chrome.tabs.sendMessage(t.id, { type: 'authChanged', signedIn })
+        .catch(() => {}); // tab may not have our content script loaded yet
+    }
+  } catch (_) {}
 }
 
 async function refreshTokens(env) {
@@ -397,39 +412,141 @@ async function handleGetOverlays() {
     }
     if (changed) await chrome.storage.local.set({ overlays });
   }
+  // Repair duplicate colors carried over from the old index-mod picker.
+  // Walk in order — first occurrence keeps its color; any later overlay
+  // sharing it gets remapped to the first unused palette slot.
+  const seen = new Set();
+  let recolored = false;
+  for (const o of overlays) {
+    if (o.color && !seen.has(o.color)) { seen.add(o.color); continue; }
+    const next = COLOR_PALETTE.find(c => !seen.has(c))
+              || COLOR_PALETTE[seen.size % COLOR_PALETTE.length];
+    o.color = next;
+    seen.add(next);
+    recolored = true;
+  }
+  if (recolored) await chrome.storage.local.set({ overlays });
   return { ok: true, overlays };
+}
+
+// Serialize every overlays read+modify+write behind a shared chain — two
+// concurrent removes / adds otherwise both read the same base list and the
+// second write clobbers the first, leaving one overlay stuck in storage
+// (visually "the chart didn't update after I removed it").
+let overlaysMutex = Promise.resolve();
+function withOverlaysLock(fn) {
+  const next = overlaysMutex.then(fn, fn);
+  overlaysMutex = next.catch(() => {}); // don't poison the chain on error
+  return next;
 }
 
 async function handleAddOverlay({ metric, label, isStrike, unit, pairedExpiration }) {
-  const { overlays = [] } = await chrome.storage.local.get('overlays');
-  if (overlays.some(o => o.metric === metric)) return { ok: true, overlays };
-  const color = COLOR_PALETTE[overlays.length % COLOR_PALETTE.length];
-  overlays.push({
-    metric, label, color,
-    isStrike: !!isStrike,
-    unit: unit || null,
-    pairedExpiration: pairedExpiration || null,
+  return withOverlaysLock(async () => {
+    const { overlays = [] } = await chrome.storage.local.get('overlays');
+    if (overlays.some(o => o.metric === metric)) return { ok: true, overlays };
+    const color = pickAvailableColor(overlays);
+    overlays.push({
+      metric, label, color,
+      isStrike: !!isStrike,
+      unit: unit || null,
+      pairedExpiration: pairedExpiration || null,
+    });
+    await chrome.storage.local.set({ overlays });
+    return { ok: true, overlays };
   });
-  await chrome.storage.local.set({ overlays });
-  return { ok: true, overlays };
+}
+
+// First color in the palette that no existing overlay currently uses. Once
+// every color is taken, fall back to cycling. Avoids the "removed one,
+// added another → duplicate color" case where two overlays end up the
+// same shade because the naive index=length picker doesn't skip already-
+// taken palette slots.
+function pickAvailableColor(overlays) {
+  const taken = new Set(overlays.map(o => o.color));
+  for (const c of COLOR_PALETTE) if (!taken.has(c)) return c;
+  return COLOR_PALETTE[overlays.length % COLOR_PALETTE.length];
 }
 
 async function handleRemoveOverlay({ metric }) {
-  const { overlays = [] } = await chrome.storage.local.get('overlays');
-  const next = overlays.filter(o => o.metric !== metric);
-  await chrome.storage.local.set({ overlays: next });
-  return { ok: true, overlays: next };
+  return withOverlaysLock(async () => {
+    const { overlays = [] } = await chrome.storage.local.get('overlays');
+    const next = overlays.filter(o => o.metric !== metric);
+    await chrome.storage.local.set({ overlays: next });
+    return { ok: true, overlays: next };
+  });
+}
+
+async function handleToggleOverlay({ metric, hidden }) {
+  return withOverlaysLock(async () => {
+    const { overlays = [] } = await chrome.storage.local.get('overlays');
+    const o = overlays.find(x => x.metric === metric);
+    if (!o) return { ok: true, overlays };
+    o.hidden = !!hidden;
+    await chrome.storage.local.set({ overlays });
+    return { ok: true, overlays };
+  });
 }
 
 async function handleGetAuthState() {
   const env = await getEnv();
   const auth = await loadAuth(env);
+  const pineIds = await loadPineIds();
   return {
     env,
     signedIn: !!auth?.access_token,
     hasClient: !!auth?.client_id,
     expiresAt: auth?.expires_at || null,
+    pineIds,
+    setupComplete: !!(auth?.access_token && pineIds.overlay && pineIds.ohlc),
   };
+}
+
+// ============================================================================
+// Pine script IDs — user-configurable so each user's private Pine copies work.
+// Storage shape: { pineIds: { overlay: '<hash>', ohlc: '<hash>' } }
+// Values are the raw 32-char hex hash portion of `USER;<hash>` — page.js
+// reconstructs the full pineId as needed.
+// ============================================================================
+
+async function loadPineIds() {
+  const { pineIds = {} } = await chrome.storage.local.get('pineIds');
+  return { overlay: pineIds.overlay || null, ohlc: pineIds.ohlc || null };
+}
+
+async function savePineIds(patch) {
+  const cur = await loadPineIds();
+  const next = { ...cur, ...patch };
+  await chrome.storage.local.set({ pineIds: next });
+  return next;
+}
+
+async function handleGetPineIds() {
+  return { ok: true, pineIds: await loadPineIds() };
+}
+
+async function handleSetPineId({ kind, hash }) {
+  if (!['overlay', 'ohlc'].includes(kind)) return { ok: false, error: 'invalid kind' };
+  const cleaned = String(hash || '').match(/[a-f0-9]{32}/i)?.[0] || null;
+  const pineIds = await savePineIds({ [kind]: cleaned });
+  broadcastPineIds(pineIds);
+  return { ok: true, pineIds };
+}
+
+async function handleClearPineId({ kind }) {
+  const pineIds = await savePineIds({ [kind]: null });
+  broadcastPineIds(pineIds);
+  return { ok: true, pineIds };
+}
+
+async function broadcastPineIds(pineIds) {
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://www.tradingview.com/chart/*' });
+    for (const t of tabs) {
+      if (t.id == null) continue;
+      chrome.tabs.sendMessage(t.id, { type: 'pineIdsChanged', pineIds })
+        .catch(() => {});
+    }
+  } catch (_) {}
 }
 
 const HANDLERS = {
@@ -438,7 +555,11 @@ const HANDLERS = {
   getOverlays:    handleGetOverlays,
   addOverlay:     handleAddOverlay,
   removeOverlay:  handleRemoveOverlay,
+  toggleOverlay:  handleToggleOverlay,
   getAuthState:   handleGetAuthState,
+  getPineIds:     handleGetPineIds,
+  setPineId:      handleSetPineId,
+  clearPineId:    handleClearPineId,
   signIn:         wrap(handleSignIn),
   signOut:        handleSignOut,
 };

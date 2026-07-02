@@ -12,10 +12,8 @@
   },
   "permissions": ["storage", "identity"],
   "host_permissions": [
-    "http://localhost:8000/*",
-    "http://127.0.0.1:8000/*",
-    "https://www.amountainofalpha.com/*",
     "https://amountainofalpha.com/*",
+    "https://www.amountainofalpha.com/*",
     "https://www.tradingview.com/*"
   ],
   "content_scripts": [

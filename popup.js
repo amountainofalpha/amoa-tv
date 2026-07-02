@@ -1,12 +1,20 @@
-const envSelect = document.getElementById('env');
-const dot       = document.getElementById('dot');
-const status    = document.getElementById('status');
-const authBtn   = document.getElementById('authBtn');
-const err       = document.getElementById('err');
+const envSelect     = document.getElementById('env');
+const dot           = document.getElementById('dot');
+const status        = document.getElementById('status');
+const authBtn       = document.getElementById('authBtn');
+const err           = document.getElementById('err');
+const setupSection  = document.getElementById('setupSection');
+const setupBanner   = document.getElementById('setupBanner');
+const overlayDot    = document.getElementById('overlayDot');
+const overlayReset  = document.getElementById('overlayReset');
+const ohlcDot       = document.getElementById('ohlcDot');
+const ohlcReset     = document.getElementById('ohlcReset');
+const readyBanner   = document.getElementById('readyBanner');
 
 async function refresh() {
   const state = await chrome.runtime.sendMessage({ type: 'getAuthState' });
   envSelect.value = state.env;
+
   if (state.signedIn) {
     dot.className = 'dot ok';
     status.textContent = 'Signed in';
@@ -17,7 +25,29 @@ async function refresh() {
     status.textContent = 'Not signed in';
     authBtn.textContent = 'Sign in';
     authBtn.dataset.action = 'signIn';
+    setupSection.hidden = true;
+    readyBanner.hidden = true;
+    return;
   }
+
+  const p = state.pineIds || {};
+  const complete = !!p.overlay && !!p.ohlc;
+  // Hide the whole Setup section (banner + both step rows) once both
+  // Pine IDs are configured — user doesn't need onboarding anymore.
+  setupSection.hidden = complete;
+  readyBanner.hidden = !complete;
+  if (!complete) {
+    applyStepState(overlayDot, overlayReset, !!p.overlay);
+    applyStepState(ohlcDot,    ohlcReset,    !!p.ohlc);
+  }
+}
+
+// Green dot + Reset button when the step is done; orange "wait" dot and
+// no Reset while pending. The step's "How to" link is a plain <a> and
+// stays visible in both states.
+function applyStepState(dotEl, resetBtn, done) {
+  dotEl.className = 'dot ' + (done ? 'ok' : 'wait');
+  resetBtn.hidden = !done;
 }
 
 envSelect.addEventListener('change', async () => {
@@ -37,6 +67,22 @@ authBtn.addEventListener('click', async () => {
     err.textContent = resp?.error || 'unknown error';
   }
   refresh();
+});
+
+overlayReset.addEventListener('click', async () => {
+  await chrome.runtime.sendMessage({ type: 'clearPineId', kind: 'overlay' });
+  refresh();
+});
+ohlcReset.addEventListener('click', async () => {
+  await chrome.runtime.sendMessage({ type: 'clearPineId', kind: 'ohlc' });
+  refresh();
+});
+
+// Live-update when background saves an auto-detected Pine ID — no need to
+// close and reopen the popup for the ✓ to appear.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  if (changes.pineIds || changes.oauth) refresh();
 });
 
 refresh();

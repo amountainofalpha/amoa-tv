@@ -2,24 +2,23 @@
   const PAGE_TAG = 'amoa-tv';
   const LINE_TOOL_LOADER_MODULE = 778255;
   const LINK_KEY_PREFIX = 'amoa-tv:'; // every draw gets linkKey=<prefix><metric>[:<seq>]
-  // Units whose values live on the price axis. Anything else needs its own
-  // scale — we get that by inserting a study and hijacking its data.
-  const PRICE_UNITS = new Set(['usd', 'usd_millions', 'usd_billions']);
+  // Units whose values live on the price axis. Only bare 'usd' — OHLC candles
+  // and strike prices — shares magnitude with the price scale. usd_millions
+  // (delta / gamma / vega / theta / notional groups) and usd_billions
+  // (market_cap) are dollar-notional at totally different orders of
+  // magnitude and belong on the left-axis AMOA study, otherwise the line
+  // gets drawn off-screen relative to the candles.
+  const PRICE_UNITS = new Set(['usd']);
   // User-installed Pine indicator we hijack for non-price metrics. Match by
   // description prefix so `indicator("AMOA Overlay")`, `indicator("AMOA VOL")`
   // etc. all count as usable slots (one per active non-price overlay).
   const AMOA_STUDY_DESC_PREFIX = 'AMOA';
   // Pine descriptor used by w.insertStudy for Pine scripts. Public API in
   // TV's guts: {type: 'pine', pineId: '<USER|PUB>;<hash>', pineVersion}.
-  // This is the *only* shape that gets Pine scripts inserted programmatically
-  // — the `type: 'java'` path errors with "Cannot get study" because the
-  // packageId comparison in TV's internals is exact-match against
-  // "tv-scripting" and the server-returned metainfo id has a build-stamp
-  // suffix like "-101".
-  const AMOA_PINE_ID = 'USER;91ba7cf3139447a3b3fb0930e49271e8';
+  // pineId is filled in per-kind from content.js via a `pineIds` message —
+  // each user has their own private copies of the AMOA Pine scripts, so
+  // the hashes are stored in chrome.storage and delivered here at runtime.
   const AMOA_PINE_VERSION = 'last';
-  const AMOA_OHLC_PINE_ID = 'USER;4188b047d90c4ee3b626a7b16a5a4d48';
-  const AMOA_OHLC_PINE_VERSION = 'last';
   // Two study "kinds":
   //   'overlay' → left-axis (percent / ratio / count / days …). Description
   //               'AMOA Overlay'. Last slot is the zero reference line.
@@ -28,18 +27,28 @@
   const SIGNED_UNITS = new Set(['percent', 'ratio', 'ratio_0_1']);
   const STUDY_KINDS = {
     overlay: {
-      pineId: AMOA_PINE_ID,
+      pineId: null, // populated by pineIdsChanged message
       pineVersion: AMOA_PINE_VERSION,
       descPrefix: 'AMOA Overlay',
       hasZeroLine: true,
     },
     ohlc: {
-      pineId: AMOA_OHLC_PINE_ID,
-      pineVersion: AMOA_OHLC_PINE_VERSION,
+      pineId: null,
+      pineVersion: AMOA_PINE_VERSION,
       descPrefix: 'AMOA OHLC',
       hasZeroLine: false,
     },
   };
+  // Description → kind classifier. Accepts either the bare 'AMOA' or the
+  // longer 'AMOA Overlay' for the left-axis study (some existing users
+  // saved it under the short name). 'AMOA OHLC' is unambiguous.
+  function classifyAmoaPine(desc) {
+    if (!desc) return null;
+    const s = String(desc).trim().toLowerCase();
+    if (s === 'amoa ohlc') return 'ohlc';
+    if (s === 'amoa' || s === 'amoa overlay') return 'overlay';
+    return null;
+  }
   // Synthetic unit key for the shared right-axis study — paired-strike
   // metrics all bucket into this one record regardless of what their
   // catalog unit is (usd, in most cases).
@@ -78,6 +87,31 @@
   let lineToolLoader = null;
 
   waitForChart().then(init).catch((e) => log('waitForChart failed', e));
+
+  // Auto-detect the user's AMOA Pine scripts by watching the chart's data
+  // sources. When a script with description "AMOA Overlay" or "AMOA OHLC"
+  // is present, extract its USER;<hash> and hand the hash to content.js.
+  // Only runs while the corresponding pineId is unset — once configured we
+  // don't overwrite (user's Setup → Reset in the popup clears it).
+  setInterval(() => {
+    const w = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.();
+    const model = w?.model?.();
+    if (!model) return;
+    for (const s of (model.dataSources?.() || [])) {
+      if (!s || s.isLineTool) continue;
+      const meta = typeof s.metaInfo === 'function' ? s.metaInfo() : s._metaInfo;
+      const kind = classifyAmoaPine(meta?.description);
+      if (!kind) continue;
+      if (STUDY_KINDS[kind].pineId) continue; // already configured
+      const m = String(meta?.id || '').match(/USER;([a-f0-9]{32})/i);
+      if (!m) continue;
+      log('detected AMOA', kind, 'Pine hash from chart:', m[1]);
+      window.postMessage({
+        tag: PAGE_TAG, dir: 'page->bg',
+        type: 'pineDetected', kind, hash: m[1],
+      }, '*');
+    }
+  }, 1500);
 
   function ensureWebpackRequire() {
     if (webpackRequire) return webpackRequire;
@@ -163,6 +197,13 @@
     if (!msg || msg.tag !== PAGE_TAG || msg.dir !== 'bg->page') return;
 
     if (msg.type === 'contentReady') { log('content bridge ready'); return; }
+    if (msg.type === 'pineIds') {
+      const p = msg.pineIds || {};
+      STUDY_KINDS.overlay.pineId = p.overlay ? `USER;${p.overlay}` : null;
+      STUDY_KINDS.ohlc.pineId    = p.ohlc    ? `USER;${p.ohlc}`    : null;
+      log('pineIds set: overlay=', !!p.overlay, 'ohlc=', !!p.ohlc);
+      return;
+    }
     if (msg.type === 'getSymbol') {
       window.postMessage({ tag: PAGE_TAG, dir: 'page->bg', type: 'symbolReply', symbol: currentSymbol }, '*');
       return;
@@ -174,7 +215,7 @@
       // studiesByUnit before the second one asks for it. Simpler than
       // per-unit in-flight dedup and cheaper than a batching protocol.
       drawSeriesQueue = drawSeriesQueue.then(() => drawSeries(
-        msg.metric, msg.color, msg.points, msg.isStrike, msg.label, msg.symbol, msg.unit
+        msg.metric, msg.color, msg.points, msg.isStrike, msg.label, msg.symbol, msg.unit, msg.hiddenMetrics
       )).catch((e) => log('drawSeries error', e?.message || e));
       return;
     }
@@ -183,7 +224,7 @@
   });
 
   // ── drawing ──────────────────────────────────────────────────────────────
-  async function drawSeries(metric, color, points, isStrike, label, symbolAtDispatch, unit) {
+  async function drawSeries(metric, color, points, isStrike, label, symbolAtDispatch, unit, hiddenMetrics) {
     if (!points?.length) { log('no points for', metric); return; }
     const stillCurrent = () => currentSymbol === symbolAtDispatch;
     if (!stillCurrent()) { log('symbol drifted before draw for', metric); return; }
@@ -200,7 +241,7 @@
     // the OHLC scale — their values are on a totally different range. Push
     // them into a hijacked study which comes with its own left-hand axis.
     if (!isStrike && unit && !PRICE_UNITS.has(unit)) {
-      await drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent, unit, kind: 'overlay' });
+      await drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent, unit, kind: 'overlay', hiddenMetrics });
       return;
     }
 
@@ -218,7 +259,7 @@
       await drawViaStudyHijack({
         w, model, metric, label, color,
         points: expanded, ts, stillCurrent,
-        unit: OHLC_UNIT_KEY, kind: 'ohlc',
+        unit: OHLC_UNIT_KEY, kind: 'ohlc', hiddenMetrics,
       });
       return;
     }
@@ -419,7 +460,7 @@
   // separate left-hand price scale that auto-fits its data range. We then
   // overwrite its computed values with ours so the axis lands where the
   // user's metric actually lives — no normalization, no shared price scale.
-  async function drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent, unit, kind }) {
+  async function drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent, unit, kind, hiddenMetrics }) {
     const record = await ensureAmoaStudyRecord({ w, model, metric, unit, kind, label, color, stillCurrent });
     if (!record) {
       log('no AMOA Overlay study available for', metric,
@@ -438,6 +479,26 @@
     log('pushed', added, 'combined points to AMOA', unit, 'study — metric', metric,
         'in slot', record.slotByMetric.get(metric),
         '(of', record.numSlots + ' slots)');
+
+    // If the whole study was hidden (e.g. user hit TV's own eye on the
+    // study), unhiding one metric via our overlay eye needs to also
+    // un-hide the study itself — otherwise nothing renders no matter what
+    // display bit we set. Preserve OTHER metrics' hidden state by
+    // stamping their plot display=0 BEFORE flipping the study visible,
+    // so the 500ms sync watcher doesn't see a transient "everything
+    // visible" state and mark them all as shown.
+    if (hiddenMetrics?.length) {
+      const styles = src._properties?.styles;
+      const stylesChilds = typeof styles?.childs === 'function' ? styles.childs() : styles;
+      for (const [otherMetric, otherSlot] of record.slotByMetric.entries()) {
+        if (otherMetric === metric) continue;
+        if (!hiddenMetrics.includes(otherMetric)) continue;
+        const plot = stylesChilds?.[`plot_${otherSlot}`];
+        const plotChilds = typeof plot?.childs === 'function' ? plot.childs() : plot;
+        try { plotChilds?.display?.setValue?.(0); } catch (_) {}
+      }
+    }
+    try { src._properties?.visible?.setValue?.(true); } catch (_) {}
   }
 
   // First, claim an unclaimed AMOA source already on the chart. If they're
@@ -504,6 +565,11 @@
   }
 
   async function ensureAmoaStudy({ w, model, metric, unit, kind, stillCurrent }) {
+    const kindDef = STUDY_KINDS[kind] || STUDY_KINDS.overlay;
+    if (!kindDef.pineId) {
+      log('cannot insert AMOA', kind, 'study — Pine ID not configured yet (open the extension popup and finish setup)');
+      return null;
+    }
     const inflight = studyInsertInFlight.get(unit);
     if (inflight) {
       log('awaiting in-flight AMOA study insert for unit', unit, 'from', metric);
@@ -511,7 +577,6 @@
     }
     const existing = studyByUnit.get(unit);
     if (existing && model.dataSourceForId(existing.sourceId)) return existing.sourceId;
-    const kindDef = STUDY_KINDS[kind] || STUDY_KINDS.overlay;
     // Match by the pineId hash embedded in metaInfo.id — that's the
     // authoritative identifier and doesn't depend on the Pine's
     // description string (which the user can name anything).
@@ -666,9 +731,42 @@
     if (visibilityWatcher) return; // one shared poll covers every study
     visibilityWatcher = setInterval(() => {
       for (const r of studyByUnit.values()) {
-        if (!r.dataByMetric.size) continue;
         const src = model.dataSourceForId(r.sourceId);
         if (!src) continue;
+
+        // Visibility sync — mirror TV's hide state onto our overlay eye
+        // icons. Two independent signals combined:
+        //   • study-level:  src._properties.visible is false when the user
+        //                   clicked the eye next to the study name (whole
+        //                   indicator hidden).
+        //   • per-plot:     styles.plot_N.display === 0 when the user hid
+        //                   just one plot inside the study.
+        // A metric is effectively visible only if BOTH are on. Fire
+        // plotVisibilityChanged whenever the combined state flips.
+        const studyVisible = src._properties?.visible?.value?.() ?? true;
+        const styles = src._properties?.styles;
+        const stylesChilds = typeof styles?.childs === 'function' ? styles.childs() : styles;
+        if (!r._prevPlotVisible) r._prevPlotVisible = new Map();
+        for (const [metric, slot] of r.slotByMetric.entries()) {
+          const plot = stylesChilds?.[`plot_${slot}`];
+          const plotChilds = typeof plot?.childs === 'function' ? plot.childs() : plot;
+          const display = plotChilds?.display?.value?.();
+          const plotShown = display == null ? true : display !== 0;
+          const effectiveVisible = studyVisible && plotShown;
+          const prev = r._prevPlotVisible.get(metric);
+          if (prev !== undefined && prev !== effectiveVisible) {
+            window.postMessage({
+              tag: PAGE_TAG, dir: 'page->bg',
+              type: 'plotVisibilityChanged',
+              metric, visible: effectiveVisible,
+            }, '*');
+          }
+          r._prevPlotVisible.set(metric, effectiveVisible);
+        }
+
+        // Data-cleared recovery (existing) — TV wipes the SortedMap on
+        // whole-study hide+show, so replay from cache.
+        if (!r.dataByMetric.size) continue;
         const size = src.data?.()?.size?.();
         if (size === 0) {
           const ts = model.timeScale?.();
@@ -716,6 +814,13 @@
     }
     data._shareRead = true;
     try { src._invalidateLastNonEmptyPlotRowCache?.(); } catch (_) {}
+    // Force TV's study-view pipeline to re-render from the mutated data.
+    // Without this, clear+re-add on the SortedMap changes the data but
+    // the plot on-screen doesn't repaint — a hidden slot's dots/line
+    // will linger until the study is fully removed. `updateAllViews()`
+    // throws on our Pine-hijacked study; `onDataUpdated()` is the one
+    // that actually drives a redraw.
+    try { src.onDataUpdated?.(); } catch (_) {}
     return added;
   }
 
@@ -731,6 +836,13 @@
     const styles = src._properties?.styles;
     const plotProps = styles?.[plotId] || styles?.childs?.()?.[plotId];
     try { plotProps?.color?.setValue?.(color); } catch (_) {}
+    // Force the plot renderer to re-initialize by dancing the display
+    // bitmask: 0 (hide) → 0xFFFFFFFF (show everywhere). A single transition
+    // from a previously-hidden state doesn't reliably wake up the OHLC
+    // circle renderer — the dance does. Both steps are synchronous, so
+    // the 500ms visibility watcher never observes the transient `0`.
+    try { plotProps?.display?.setValue?.(0); } catch (_) {}
+    try { plotProps?.display?.setValue?.(0xFFFFFFFF); } catch (_) {}
     // For the OHLC (right-axis) kind, override the plot style to circles
     // so each snapshot renders as a discrete dot instead of connecting via
     // diagonals across strike jumps. TV's PlotStyle enum values:
@@ -770,13 +882,30 @@
       if (r.sourceId === id) { ownerUnit = u; ownerRecord = r; break; }
     }
     if (!ownerRecord) return true;
+    const freedSlot = ownerRecord.slotByMetric.get(metric);
     ownerRecord.slotByMetric.delete(metric);
     ownerRecord.dataByMetric.delete(metric);
+    // Drop the visibility-watcher's cache entry too so a later slot re-claim
+    // doesn't fire a spurious plotVisibilityChanged when applyAmoaSlotStyling
+    // resets display back to shown.
+    ownerRecord._prevPlotVisible?.delete?.(metric);
     // Re-push so the removed metric's line disappears immediately.
     const model = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.()?.model?.();
     if (model) {
       const src = model.dataSourceForId(id);
       const ts = model.timeScale?.();
+      // Hide the freed plot in TV's UI. Nulling the data + onDataUpdated
+      // isn't enough for the circle-plot renderer to drop its cached dots
+      // — flipping the plot's display bitmask to 0 forces TV to stop
+      // painting the slot. applyAmoaSlotStyling resets it to 0xFFFFFFFF
+      // when a metric later reclaims the slot.
+      if (src && freedSlot != null) {
+        try {
+          const styles = src._properties?.styles;
+          const plot = styles?.[`plot_${freedSlot}`] || styles?.childs?.()?.[`plot_${freedSlot}`];
+          plot?.display?.setValue?.(0);
+        } catch (_) {}
+      }
       if (src && ts && ownerRecord.slotByMetric.size > 0) {
         pushCombinedDataToStudy(src, ownerRecord, ts);
       } else if (src && ownerRecord.slotByMetric.size === 0) {

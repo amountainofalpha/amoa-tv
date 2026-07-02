@@ -17,6 +17,9 @@ let brandEl = null;
 let highlightIdx = 0;
 let filteredEntries = [];
 let loadingCount = 0; // active fetches — spinner shown while > 0
+let signedIn = false; // gates panel mount + all fetching / drawing
+let pineIds = { overlay: null, ohlc: null }; // per-user Pine hashes
+let setupComplete = false; // signedIn && both pineIds set
 
 // ── page ↔ content bridge ─────────────────────────────────────────────────
 window.addEventListener('message', (ev) => {
@@ -27,8 +30,43 @@ window.addEventListener('message', (ev) => {
   if (msg.type === 'symbolChanged') {
     currentSymbol = msg.symbol;
     log('symbol changed →', currentSymbol);
-    refreshOverlaysForSymbol();
+    if (setupComplete) refreshOverlaysForSymbol();
   }
+  if (msg.type === 'pineDetected') {
+    // page.js found a Pine study whose description matches AMOA — hand
+    // the hash to background to save + broadcast back. We only get these
+    // events when the hash is still unset (page-side guard).
+    bgSend({ type: 'setPineId', kind: msg.kind, hash: msg.hash });
+  }
+  if (msg.type === 'plotVisibilityChanged') {
+    // User hid/showed a specific plot in the AMOA study via TV's UI —
+    // mirror that state onto our overlay's `hidden` flag so the eye
+    // icon matches.
+    applyPlotVisibility(msg.metric, msg.visible);
+  }
+});
+
+async function applyPlotVisibility(metric, visible) {
+  const o = overlays.find(x => x.metric === metric);
+  if (!o) return;
+  const targetHidden = !visible;
+  if (!!o.hidden === targetHidden) return; // already in sync
+  const r = await bgSend({ type: 'toggleOverlay', metric, hidden: targetHidden });
+  overlays = r?.overlays || overlays;
+  renderChips();
+  // Note: we do NOT postToPage clearMetric here. TV already hid the plot
+  // (data stays in the study); flipping our flag is enough. When the user
+  // later re-enables via our eye icon, drawOverlay → applyAmoaSlotStyling
+  // resets display and the plot re-appears.
+}
+
+// Background pushes authChanged / pineIdsChanged whenever the user signs
+// in-out or configures a Pine ID via the popup. Mount/unmount panel and
+// clear/refresh drawings inline so the plugin behaves as active/inactive
+// without a page reload.
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg?.type === 'authChanged') { signedIn = !!msg.signedIn; applyState(); }
+  if (msg?.type === 'pineIdsChanged') { pineIds = msg.pineIds || pineIds; applyState(); }
 });
 
 function postToPage(payload) {
@@ -50,25 +88,43 @@ async function bgSend(msg) {
 // ── init ─────────────────────────────────────────────────────────────────
 buildPanel();
 installKeyboardShield();
-mountPanel();
 loadInitialState();
 
 // TradingView occasionally clears added nodes on layout switches and the
 // tab strip moves when it collapses/expands. Cheap heartbeat that re-mounts
-// and re-positions on each tick.
-setInterval(() => { mountPanel(); }, 500);
+// and re-positions on each tick. Only runs while fully set up.
+setInterval(() => { if (setupComplete) mountPanel(); }, 500);
 
 async function loadInitialState() {
+  const auth = await bgSend({ type: 'getAuthState' });
+  signedIn = !!auth?.signedIn;
+  pineIds = auth?.pineIds || { overlay: null, ohlc: null };
+  // Always relay pineIds to page.js so its auto-detect skips already-set
+  // kinds even during onboarding.
+  postToPage({ type: 'pineIds', pineIds });
+  await applyState();
+}
+
+async function applyState() {
+  setupComplete = signedIn && !!pineIds.overlay && !!pineIds.ohlc;
+  postToPage({ type: 'pineIds', pineIds });
+  if (!setupComplete) {
+    unmountPanel();
+    postToPage({ type: 'clearAll' });
+    return;
+  }
+  mountPanel();
   const ov = await bgSend({ type: 'getOverlays' });
   overlays = ov?.overlays || [];
   renderChips();
-  // catalog is fetched lazily on first search input to save an initial RTT
   postToPage({ type: 'contentReady' });
-  // Race: page.js may have already delivered symbolChanged while overlays
-  // were still loading from storage. In that case, refreshOverlaysForSymbol
-  // ran with an empty list and returned early. Now that we have both symbol
-  // and overlays, redraw.
   if (currentSymbol && overlays.length) refreshOverlaysForSymbol();
+}
+
+function unmountPanel() {
+  closeDropdown();
+  closeActiveMenu();
+  if (panelEl?.isConnected) panelEl.remove();
 }
 
 // ── UI ────────────────────────────────────────────────────────────────────
@@ -142,8 +198,10 @@ function buildPanel() {
     padding: 4px 8px; font-size: 12px; outline: none;
   `;
   inputEl.addEventListener('input', onInput);
-  inputEl.addEventListener('keydown', onKeyDown);
   inputEl.addEventListener('focus', onFocus);
+  // keydown is routed via installKeyboardShield → onKeyDown so the shield's
+  // stopPropagation (needed to keep TV from stealing keys) doesn't also
+  // block the input's own target-phase listener.
   inputWrap.appendChild(inputEl);
   panelEl.appendChild(inputWrap);
 
@@ -198,11 +256,15 @@ window.addEventListener('resize', () => {
 
 // TradingView listens to keyboard events on document with capture: true, so
 // our target-phase handlers never get a chance to stop them. Intercept in
-// the capture phase for any event that originates inside our panel.
+// the capture phase for any event that originates inside our panel — but
+// stopPropagation also halts the event before it reaches the input's own
+// target-phase listener, so route keydown into onKeyDown directly from
+// the shield instead of relying on the input listener.
 function installKeyboardShield() {
   const shield = (e) => {
     if (!panelEl?.contains(e.target)) return;
     e.stopPropagation();
+    if (e.type === 'keydown' && e.target === inputEl) onKeyDown(e);
   };
   document.addEventListener('keydown',  shield, true);
   document.addEventListener('keyup',    shield, true);
@@ -279,6 +341,7 @@ function closeDropdown() {
   if (inputEl) inputEl.value = '';
   filteredEntries = [];
   highlightIdx = 0;
+  hideTooltip();
 }
 
 function updateFiltered() {
@@ -313,6 +376,7 @@ function updateFiltered() {
 function renderRows() {
   if (!dropdownEl) return;
   dropdownEl.innerHTML = '';
+  hideTooltip(); // any hovered ? was just wiped
   positionDropdown();
 
   if (!catalog) {
@@ -354,13 +418,61 @@ function renderRows() {
     group.style.cssText = 'color: rgb(161, 161, 170); font-size: 10px; flex-shrink: 0;';
     row.appendChild(group);
 
-    const desc = document.createElement('span');
-    desc.textContent = e.description || '';
-    desc.style.cssText = 'color: rgb(113, 113, 122); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;';
-    row.appendChild(desc);
+    if (e.description) {
+      const help = document.createElement('span');
+      help.textContent = '?';
+      help.style.cssText = `
+        display: inline-flex; align-items: center; justify-content: center;
+        width: 14px; height: 14px; border-radius: 50%;
+        background: rgba(82, 82, 91, 0.5); color: rgb(212, 212, 216);
+        font-size: 10px; font-weight: 600; cursor: help; flex-shrink: 0;
+        margin-left: auto;
+      `;
+      // Custom tooltip — native `title` doesn't render reliably inside our
+      // floating dropdown and has a 500ms delay. Show/hide on hover events.
+      help.addEventListener('mouseenter', () => showTooltip(help, e.description));
+      help.addEventListener('mouseleave', hideTooltip);
+      // Stop mousedown from bubbling so hovering ? doesn't pick the metric.
+      help.addEventListener('mousedown', (ev) => ev.stopPropagation());
+      row.appendChild(help);
+    }
 
     dropdownEl.appendChild(row);
   });
+}
+
+let tooltipEl = null;
+function showTooltip(anchor, text) {
+  if (!tooltipEl) {
+    tooltipEl = document.createElement('div');
+    tooltipEl.style.cssText = `
+      position: fixed; z-index: 1000000;
+      background: rgba(24, 24, 27, 0.98); color: rgb(228, 228, 231);
+      border: 1px solid rgba(82, 82, 91, 0.6); border-radius: 4px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.45);
+      padding: 6px 8px; font-size: 11px; line-height: 1.4;
+      max-width: 320px; pointer-events: none;
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    `;
+    document.body.appendChild(tooltipEl);
+  }
+  tooltipEl.textContent = text;
+  tooltipEl.style.display = 'block';
+  // Position: prefer left of the ? icon; flip above if it would overflow.
+  const r = anchor.getBoundingClientRect();
+  // Measure after content is set + display block.
+  const tw = tooltipEl.offsetWidth;
+  const th = tooltipEl.offsetHeight;
+  let left = r.left - tw - 8;
+  if (left < 8) left = r.right + 8; // no room on left → put it right
+  let top = r.top + (r.height / 2) - (th / 2);
+  if (top < 8) top = 8;
+  if (top + th > window.innerHeight - 8) top = window.innerHeight - th - 8;
+  tooltipEl.style.left = `${Math.round(left)}px`;
+  tooltipEl.style.top = `${Math.round(top)}px`;
+}
+function hideTooltip() {
+  if (tooltipEl) tooltipEl.style.display = 'none';
 }
 
 function updateRowHighlight() {
@@ -456,7 +568,24 @@ function renderActiveMenu() {
     row.style.cssText = `
       display: flex; align-items: center; gap: 8px; padding: 6px 10px;
       font-size: 12px; border-bottom: 1px solid rgba(63, 63, 70, 0.4);
+      opacity: ${o.hidden ? '0.5' : '1'};
     `;
+
+    const eye = document.createElement('button');
+    eye.type = 'button';
+    eye.title = o.hidden ? 'Show overlay' : 'Hide overlay';
+    eye.innerHTML = eyeIconSvg(!!o.hidden);
+    eye.style.cssText = `
+      background: transparent; color: rgb(161, 161, 170);
+      border: 0; cursor: pointer; padding: 0;
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 16px; height: 16px; flex-shrink: 0;
+    `;
+    eye.addEventListener('mouseenter', () => { eye.style.color = 'rgb(228, 228, 231)'; });
+    eye.addEventListener('mouseleave', () => { eye.style.color = 'rgb(161, 161, 170)'; });
+    eye.addEventListener('click', () => toggleOverlayVisible(o.metric));
+    row.appendChild(eye);
+
     const dot = document.createElement('span');
     dot.style.cssText = `width: 8px; height: 8px; border-radius: 50%; background: ${o.color}; flex-shrink: 0;`;
     row.appendChild(dot);
@@ -464,7 +593,8 @@ function renderActiveMenu() {
     const name = document.createElement('span');
     name.textContent = o.label || o.metric;
     name.title = o.metric;
-    name.style.cssText = 'font-family: ui-monospace, monospace; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;';
+    name.style.cssText = 'font-family: ui-monospace, monospace; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer;';
+    name.addEventListener('click', () => toggleOverlayVisible(o.metric));
     row.appendChild(name);
 
     const x = document.createElement('button');
@@ -488,6 +618,39 @@ function renderActiveMenu() {
   }
 }
 
+function eyeIconSvg(hidden) {
+  // Feather-icons "eye" and "eye-off". currentColor + strokes so the
+  // hover color change on the button also colors the icon.
+  if (hidden) {
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14"
+      viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+      stroke-linecap="round" stroke-linejoin="round">
+      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+      <line x1="1" y1="1" x2="23" y2="23"/>
+    </svg>`;
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14"
+    viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+    stroke-linecap="round" stroke-linejoin="round">
+    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+    <circle cx="12" cy="12" r="3"/>
+  </svg>`;
+}
+
+async function toggleOverlayVisible(metric) {
+  const o = overlays.find(x => x.metric === metric);
+  if (!o) return;
+  const nextHidden = !o.hidden;
+  const r = await bgSend({ type: 'toggleOverlay', metric, hidden: nextHidden });
+  overlays = r?.overlays || overlays;
+  renderChips();
+  if (nextHidden) {
+    postToPage({ type: 'clearMetric', metric });
+  } else {
+    await drawOverlay(metric);
+  }
+}
+
 async function removeOverlay(metric) {
   const r = await bgSend({ type: 'removeOverlay', metric });
   overlays = r?.overlays || overlays;
@@ -498,7 +661,7 @@ async function removeOverlay(metric) {
 async function drawOverlay(metric) {
   if (!currentSymbol) return;
   const overlay = overlays.find(o => o.metric === metric);
-  if (!overlay) return;
+  if (!overlay || overlay.hidden) return;
   const targetSymbol = currentSymbol;
   startLoading();
   const r = await bgSend({
@@ -519,6 +682,7 @@ async function drawOverlay(metric) {
     unit: overlay.unit || null,
     label: overlay.label || overlay.metric,
     points,
+    hiddenMetrics: overlays.filter(o => o.hidden).map(o => o.metric),
   });
 }
 
@@ -528,8 +692,9 @@ async function refreshOverlaysForSymbol() {
   const gen = ++fetchGeneration;
   const targetSymbol = currentSymbol;
   postToPage({ type: 'clearAll' });
-  if (!overlays.length || !targetSymbol) return;
-  const metrics = overlays.map(o => o.metric);
+  const visible = overlays.filter(o => !o.hidden);
+  if (!visible.length || !targetSymbol) return;
+  const metrics = visible.map(o => o.metric);
   startLoading();
   const r = await bgSend({
     type: 'fetchHistory',
@@ -540,7 +705,8 @@ async function refreshOverlaysForSymbol() {
   if (gen !== fetchGeneration) { log('stale fetch abandoned for', targetSymbol); return; }
   if (targetSymbol !== currentSymbol) { log('symbol shifted, abandoning', targetSymbol); return; }
   if (!r?.ok) { log('bulk history fetch failed', r?.error); return; }
-  for (const o of overlays) {
+  const hiddenMetrics = overlays.filter(o => o.hidden).map(o => o.metric);
+  for (const o of visible) {
     const points = r.series?.[o.metric] || [];
     postToPage({
       type: 'drawSeries',
@@ -551,6 +717,7 @@ async function refreshOverlaysForSymbol() {
       unit: o.unit || null,
       label: o.label || o.metric,
       points,
+      hiddenMetrics,
     });
   }
 }
