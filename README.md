@@ -8,10 +8,12 @@ Chrome extension that overlays [A Mountain Of Alpha](https://www.amountainofalph
 
 ## Install
 
-1. Download the latest `amoa-tv-v<version>.zip` from [Releases](https://github.com/amountainofalpha/amoa-tv/releases) and unzip it.
-2. Open `chrome://extensions` and enable **Developer mode** (top-right).
-3. Click **Load unpacked** and select the unzipped folder.
+1. Download the latest `amoa-tv-v<version>.zip` from [Releases](https://github.com/amountainofalpha/amoa-tv/releases). No need to unzip it.
+2. Open `chrome://extensions` (or `brave://extensions`) and enable **Developer mode** in the top-right corner.
+3. **Drag and drop the `.zip` file** anywhere onto the extensions page. Brave / Chrome unpacks and installs it in place.
 4. Pin the extension so the popup is one click away.
+
+<sub>If drag-and-drop doesn't take, unzip the file manually, then click **Load unpacked** and pick the unzipped folder.</sub>
 
 ---
 

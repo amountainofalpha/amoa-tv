@@ -13,7 +13,11 @@ const readyBanner   = document.getElementById('readyBanner');
 
 async function refresh() {
   const state = await chrome.runtime.sendMessage({ type: 'getAuthState' });
-  envSelect.value = state.env;
+  // envSelect is stripped from the popup in prod builds (see build.sh) —
+  // guard so a null reference doesn't abort refresh() before the auth
+  // button's dataset.action is set (which would leave the popup stuck
+  // on "checking..." and the Sign-in click a no-op).
+  if (envSelect) envSelect.value = state.env;
 
   if (state.signedIn) {
     dot.className = 'dot ok';
@@ -50,11 +54,13 @@ function applyStepState(dotEl, resetBtn, done) {
   resetBtn.hidden = !done;
 }
 
-envSelect.addEventListener('change', async () => {
-  await chrome.storage.local.set({ env: envSelect.value });
-  err.hidden = true;
-  refresh();
-});
+if (envSelect) {
+  envSelect.addEventListener('change', async () => {
+    await chrome.storage.local.set({ env: envSelect.value });
+    err.hidden = true;
+    refresh();
+  });
+}
 
 authBtn.addEventListener('click', async () => {
   err.hidden = true;
