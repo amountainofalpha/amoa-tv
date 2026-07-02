@@ -58,8 +58,8 @@ indicator('AMOA', overlay=true, scale=scale.left)
 plot(na, 'data 1')
 plot(na, 'data 2')
 plot(na, 'data 3')
-plot(na, 'data 3')
-plot(na, 'data 3')
+plot(na, 'data 4')
+plot(na, 'data 5')
 ```
 
 ### 3. Save (`⌘S` / `Ctrl+S`)
@@ -98,8 +98,8 @@ indicator('AMOA OHLC', overlay=true)
 plot(na, 'data 1')
 plot(na, 'data 2')
 plot(na, 'data 3')
-plot(na, 'data 3')
-plot(na, 'data 3')
+plot(na, 'data 4')
+plot(na, 'data 5')
 ```
 
 Save it (`⌘S` / `Ctrl+S`), name it exactly **`AMOA OHLC`**, then click **Add to chart** again.
