@@ -1035,20 +1035,35 @@
         row[1 + slot] = p.value;
       }
     }
-    // Convert to (barIndex, row) entries, sorted by index.
+    // Convert to (barIndex, row) entries, sorted by index. Values are
+    // daily, so each row covers [its day's first bar, next day's first
+    // bar): on a daily chart that's exactly one bar; on intraday charts
+    // it fills every bar of the session so a 5m chart shows the level
+    // across the whole day instead of one lone dot.
+    const DAY = 86400;
     const rows = [];
     for (const row of byTime.values()) {
       const idx = ts.timePointToIndex(row[0], true);
       if (!Number.isFinite(idx)) continue;
-      rows.push({ idx, row });
+      let idxEnd = ts.timePointToIndex(row[0] + DAY, true);
+      if (!Number.isFinite(idxEnd) || idxEnd <= idx) idxEnd = idx + 1;
+      rows.push({ idx, idxEnd, row });
     }
     rows.sort((a, b) => a.idx - b.idx);
 
     data._shareRead = false;
     data.clear();
     let added = 0;
-    for (const { idx, row } of rows) {
-      if (data.add(idx, row) !== false) added++;
+    for (let i = 0; i < rows.length; i++) {
+      const { idx, idxEnd, row } = rows[i];
+      const next = rows[i + 1];
+      // Fill the day, but never past the next row's start (day boundaries
+      // can clamp oddly around weekends). Future rows extrapolate into the
+      // right margin on purpose — strike trails run out to expiration.
+      const end = Math.min(idxEnd, next ? next.idx : idxEnd);
+      for (let j = idx; j === idx || j < end; j++) {
+        if (data.add(j, row) !== false) added++;
+      }
     }
     data._shareRead = true;
     if (outliers) {
