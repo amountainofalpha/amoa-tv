@@ -44,7 +44,21 @@ window.addEventListener('message', (ev) => {
     // icon matches.
     applyPlotVisibility(msg.metric, msg.visible);
   }
+  if (msg.type === 'studyRemoved') {
+    // User deleted an AMOA / AMOA OHLC study from the chart entirely.
+    // Purge every overlay that was hosted in it so the extension's list
+    // stays in sync with what's actually on the chart.
+    applyStudyRemoved(msg.metrics || []);
+  }
 });
+
+async function applyStudyRemoved(metrics) {
+  if (!metrics.length) return;
+  for (const m of metrics) await bgSend({ type: 'removeOverlay', metric: m });
+  const r = await bgSend({ type: 'getOverlays' });
+  overlays = r?.overlays || overlays;
+  renderChips();
+}
 
 async function applyPlotVisibility(metric, visible) {
   const o = overlays.find(x => x.metric === metric);
@@ -684,6 +698,7 @@ async function drawOverlay(metric) {
     points,
     hiddenMetrics: overlays.filter(o => o.hidden).map(o => o.metric),
   });
+  postToPage({ type: 'pruneUnusedStudies' });
 }
 
 let fetchGeneration = 0;
@@ -720,6 +735,7 @@ async function refreshOverlaysForSymbol() {
       hiddenMetrics,
     });
   }
+  postToPage({ type: 'pruneUnusedStudies' });
 }
 
 function startLoading() {

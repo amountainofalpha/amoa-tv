@@ -221,7 +221,39 @@
     }
     if (msg.type === 'clearMetric') { clearMetric(msg.metric); return; }
     if (msg.type === 'clearAll')    { clearAllOverlays(); return; }
+    if (msg.type === 'pruneUnusedStudies') {
+      // Chain onto the draw queue so we don't yank a study out from
+      // under an in-flight hijack.
+      drawSeriesQueue = drawSeriesQueue.then(() => pruneUnusedStudies())
+        .catch(e => log('pruneUnusedStudies error', e?.message || e));
+      return;
+    }
   });
+
+  // Remove any AMOA / AMOA OHLC studies on the chart whose sourceId
+  // isn't currently claimed by studyByUnit. Covers the empty copies from
+  // initial setup (once we've captured their hashes and started using
+  // one) and leftover empties from removed metrics.
+  function pruneUnusedStudies() {
+    const model = window._exposed_chartWidgetCollection?.activeChartWidget?.value?.()?.model?.();
+    if (!model) return;
+    const claimed = new Set([...studyByUnit.values()].map(r => r.sourceId));
+    const knownHashes = Object.values(STUDY_KINDS)
+      .map(k => (k.pineId || '').match(/USER;[a-f0-9]+/i)?.[0])
+      .filter(Boolean);
+    if (!knownHashes.length) return;
+    let removed = 0;
+    for (const s of model.dataSources()) {
+      if (!s || s.isLineTool) continue;
+      const meta = typeof s.metaInfo === 'function' ? s.metaInfo() : s._metaInfo;
+      const mid = meta?.id || '';
+      if (!knownHashes.some(h => mid.includes(h))) continue;
+      const id = String(s._id?.value?.() ?? s._id);
+      if (claimed.has(id)) continue;
+      try { model.removeSource(s); removed++; } catch (_) {}
+    }
+    if (removed) log('pruned', removed, 'unused AMOA studies');
+  }
 
   // ── drawing ──────────────────────────────────────────────────────────────
   async function drawSeries(metric, color, points, isStrike, label, symbolAtDispatch, unit, hiddenMetrics) {
@@ -730,6 +762,24 @@
   function installVisibilityGuard(model, record) {
     if (visibilityWatcher) return; // one shared poll covers every study
     visibilityWatcher = setInterval(() => {
+      // User-deleted study detection: if a claimed source no longer
+      // resolves, the user removed it from the chart (right-click →
+      // Remove on the AMOA legend entry, or removed the whole pane).
+      // Drop our record + notify content.js to purge those overlays.
+      for (const [unit, r] of [...studyByUnit.entries()]) {
+        if (model.dataSourceForId(r.sourceId)) continue;
+        const affectedMetrics = [...r.slotByMetric.keys()];
+        log('AMOA', unit, 'study removed from chart — dropping', affectedMetrics.length, 'metrics');
+        studyByUnit.delete(unit);
+        for (const m of affectedMetrics) studiesByMetric.delete(m);
+        if (affectedMetrics.length) {
+          window.postMessage({
+            tag: PAGE_TAG, dir: 'page->bg',
+            type: 'studyRemoved', metrics: affectedMetrics,
+          }, '*');
+        }
+      }
+
       for (const r of studyByUnit.values()) {
         const src = model.dataSourceForId(r.sourceId);
         if (!src) continue;
