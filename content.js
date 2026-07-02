@@ -90,13 +90,46 @@ function postToPage(payload) {
 // Thin wrapper around chrome.runtime.sendMessage that swallows the
 // "message channel closed" rejection that fires when the background
 // service worker is restarting mid-flight. Returns null on that failure
-// so callers can no-op cleanly instead of propagating an unhandled promise.
+// so callers can no-op cleanly instead of propagating an unhandled
+// promise. Also detects the permanent "Extension context invalidated"
+// case (extension was reloaded / updated while this content script kept
+// running) and shows an in-panel notice — no message can succeed until
+// the tab is reloaded.
+let contextInvalidated = false;
 async function bgSend(msg) {
+  if (contextInvalidated) return null;
   try { return await chrome.runtime.sendMessage(msg); }
   catch (e) {
-    log('bg message failed', msg?.type, e?.message || e);
+    const errMsg = e?.message || String(e);
+    log('bg message failed', msg?.type, errMsg);
+    if (errMsg.includes('Extension context invalidated')) {
+      contextInvalidated = true;
+      showStaleNotice();
+    }
     return null;
   }
+}
+
+let staleNoticeEl = null;
+function showStaleNotice() {
+  if (staleNoticeEl) return;
+  staleNoticeEl = document.createElement('div');
+  staleNoticeEl.style.cssText = `
+    position: fixed; z-index: 1000000;
+    top: 12px; left: 50%; transform: translateX(-50%);
+    background: rgba(153, 27, 27, 0.95); color: rgb(254, 226, 226);
+    border: 1px solid rgba(248, 113, 113, 0.6); border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    padding: 8px 14px; font-size: 12px; line-height: 1.4;
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    pointer-events: auto; cursor: pointer;
+    max-width: 420px;
+  `;
+  staleNoticeEl.innerHTML = 'AMOA extension was updated — <b>click here to reload this tab</b> and reconnect.';
+  staleNoticeEl.addEventListener('click', () => location.reload());
+  document.body.appendChild(staleNoticeEl);
+  // Tear down our panel too — it can't do anything useful now.
+  try { unmountPanel(); } catch (_) {}
 }
 
 // ── init ─────────────────────────────────────────────────────────────────
