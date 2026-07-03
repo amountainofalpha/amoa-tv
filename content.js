@@ -96,23 +96,64 @@ async function applyPlotVisibility(metric, visible) {
 // without a page reload.
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.type === 'authChanged') { signedIn = !!msg.signedIn; applyState(); }
-  if (msg?.type === 'pineIdsChanged') { pineIds = msg.pineIds || pineIds; applyState(); }
+  if (msg?.type === 'pineIdsChanged') {
+    pineIds = msg.pineIds || pineIds;
+    // This only fires on explicit setPineId / clearPineId actions — if the
+    // user reset everything on purpose, drop the site backup too so it
+    // doesn't resurrect the old config on the next tab load.
+    if (!pineIds.overlay && !pineIds.ohlc && !overlays.length) {
+      try { localStorage.removeItem(CONFIG_BACKUP_KEY); } catch (_) {}
+    } else {
+      mirrorConfigBackup();
+    }
+    applyState();
+  }
 });
 
-// Settings live in chrome.storage and are edited from the popup — pick up
-// changes live and redraw so a toggle (e.g. outlier exclusion) applies
-// without a page reload.
+// Settings live in chrome.storage.sync (configGet/configSet in config.js,
+// loaded ahead of us) and are edited from the popup — pick up changes live
+// and redraw so a toggle (e.g. outlier exclusion) applies without a page
+// reload. 'local' is still accepted for pre-migration installs.
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== 'local' || !changes.settings) return;
+  if ((area !== 'sync' && area !== 'local') || !changes.settings) return;
   settings = { ...settings, ...(changes.settings.newValue || {}) };
+  mirrorConfigBackup();
   if (setupComplete) refreshOverlaysForSymbol();
 });
-chrome.storage.local.get('settings').then(({ settings: s }) => {
+configGet('settings').then((s) => {
   settings = { ...settings, ...(s || {}) };
 }).catch(() => {});
 
 function postToPage(payload) {
   window.postMessage({ tag: PAGE_TAG, dir: 'bg->page', ...payload }, '*');
+}
+
+// ── reinstall recovery via the tradingview.com origin ────────────────────
+// Extension storage (local AND sync when Chrome sync is off) is wiped on
+// uninstall, but this content script runs on tradingview.com — storage
+// written here belongs to the site origin and survives extension
+// reinstalls. Mirror the config (never auth tokens: page scripts can read
+// this) and offer it back to background when its storage comes up empty.
+const CONFIG_BACKUP_KEY = 'amoa-tv:config-backup';
+
+function mirrorConfigBackup() {
+  try {
+    // Never clobber a useful backup with the empty state of a
+    // just-reinstalled extension that hasn't restored yet.
+    if (!overlays.length && !pineIds.overlay && !pineIds.ohlc) return;
+    localStorage.setItem(CONFIG_BACKUP_KEY, JSON.stringify({
+      overlays, settings, pineIds, savedAt: Date.now(),
+    }));
+  } catch (_) {}
+}
+
+function readConfigBackup() {
+  try {
+    const raw = localStorage.getItem(CONFIG_BACKUP_KEY);
+    if (!raw) return null;
+    const b = JSON.parse(raw);
+    return b && typeof b === 'object' ? b : null;
+  } catch (_) { return null; }
 }
 
 // Thin wrapper around chrome.runtime.sendMessage that swallows the
@@ -174,6 +215,19 @@ async function loadInitialState() {
   const auth = await bgSend({ type: 'getAuthState' });
   signedIn = !!auth?.signedIn;
   pineIds = auth?.pineIds || { overlay: null, ohlc: null };
+  // Reinstall recovery: no Pine IDs usually means extension storage was
+  // wiped (uninstall) — offer the site-origin backup back to background
+  // before deciding onboarding is needed.
+  if (!pineIds.overlay && !pineIds.ohlc) {
+    const backup = readConfigBackup();
+    if (backup && (backup.pineIds?.overlay || backup.pineIds?.ohlc || backup.overlays?.length)) {
+      const r = await bgSend({ type: 'restoreConfig', config: backup });
+      if (r?.ok && r.restored) {
+        pineIds = r.pineIds || pineIds;
+        log('restored config from tradingview.com localStorage backup');
+      }
+    }
+  }
   // Always relay pineIds to page.js so its auto-detect skips already-set
   // kinds even during onboarding.
   postToPage({ type: 'pineIds', pineIds });
@@ -578,6 +632,9 @@ async function pickMetric(entry) {
 
 function renderChips() {
   if (!activeBtnEl) return;
+  // renderChips runs after every overlays mutation — piggyback the
+  // site-origin config mirror here so it never goes stale.
+  mirrorConfigBackup();
   const n = overlays.length;
   activeBtnEl.innerHTML = '';
   // Color dot preview showing the first overlay's swatch when there's exactly
@@ -768,10 +825,14 @@ let fetchGeneration = 0;
 async function refreshOverlaysForSymbol() {
   const gen = ++fetchGeneration;
   const targetSymbol = currentSymbol;
-  postToPage({ type: 'clearAll' });
-  const visible = overlays.filter(o => !o.hidden);
-  if (!visible.length || !targetSymbol) return;
-  const metrics = visible.map(o => o.metric);
+  // Soft clear: line tools go, hijack studies stay on the chart (blanked)
+  // so TV's own hide/eye state survives the chart switch. Hidden overlays
+  // are fetched + drawn too — page.js replaces their study data silently
+  // without touching visibility, so unhiding later shows the new symbol's
+  // series instead of stale (or no) data.
+  postToPage({ type: 'softClear' });
+  if (!overlays.length || !targetSymbol) return;
+  const metrics = overlays.map(o => o.metric);
   startLoading();
   const r = await bgSend({
     type: 'fetchHistory',
@@ -783,7 +844,7 @@ async function refreshOverlaysForSymbol() {
   if (targetSymbol !== currentSymbol) { log('symbol shifted, abandoning', targetSymbol); return; }
   if (!r?.ok) { log('bulk history fetch failed', r?.error); return; }
   const hiddenMetrics = overlays.filter(o => o.hidden).map(o => o.metric);
-  for (const o of visible) {
+  for (const o of overlays) {
     const points = r.series?.[o.metric] || [];
     postToPage({
       type: 'drawSeries',
@@ -794,6 +855,7 @@ async function refreshOverlaysForSymbol() {
       unit: o.unit || null,
       label: o.label || o.metric,
       points,
+      hidden: !!o.hidden,
       hiddenMetrics,
       excludeOutliers: settings.excludeOutliers !== false,
     });

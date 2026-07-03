@@ -56,7 +56,7 @@ async function refresh() {
   readyBanner.hidden = !complete;
   settingsSection.hidden = !complete;
   if (complete) {
-    const { settings = {} } = await chrome.storage.local.get('settings');
+    const settings = (await configGet('settings')) || {};
     excludeOutliers.value = settings.excludeOutliers === false ? 'no' : 'yes';
   }
   if (!complete) {
@@ -101,9 +101,9 @@ overlayReset.addEventListener('click', async () => {
 // Persist setting changes — content.js watches chrome.storage and
 // redraws the overlays live, so no reload is needed.
 excludeOutliers.addEventListener('change', async () => {
-  const { settings = {} } = await chrome.storage.local.get('settings');
+  const settings = (await configGet('settings')) || {};
   settings.excludeOutliers = excludeOutliers.value === 'yes';
-  await chrome.storage.local.set({ settings });
+  await configSet({ settings });
 });
 
 ohlcReset.addEventListener('click', async () => {
@@ -112,10 +112,10 @@ ohlcReset.addEventListener('click', async () => {
 });
 
 // Live-update when background saves an auto-detected Pine ID — no need to
-// close and reopen the popup for the ✓ to appear.
+// close and reopen the popup for the ✓ to appear. pineIds live in sync
+// storage now; oauth stays local.
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== 'local') return;
-  if (changes.pineIds || changes.oauth) refresh();
+  if (changes.pineIds || (area === 'local' && changes.oauth)) refresh();
 });
 
 refresh();

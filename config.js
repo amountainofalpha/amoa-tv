@@ -9,7 +9,7 @@ const SCOPE = 'amoa.read';
 const CLIENT_NAME = 'AMOA TradingView Overlay';
 
 // AMOA Overlay Pine study identifiers are per-user, stored in
-// chrome.storage.local under `pineIds` — each user provides their own hash
+// chrome.storage.sync under `pineIds` — each user provides their own hash
 // via the popup onboarding wizard (auto-detected once they add the Pine
 // script to their chart).
 
@@ -27,6 +27,28 @@ const COLOR_PALETTE = [
 async function getEnv() {
   const { env } = await chrome.storage.local.get('env');
   return env || DEFAULT_ENV;
+}
+
+// ── persistent config (survives reinstalls) ─────────────────────────────────
+// User config lives in chrome.storage.sync so a reinstall (or a new machine
+// on the same Chrome profile) restores onboarding (pineIds), overlays and
+// settings without redoing setup. OAuth tokens deliberately stay in
+// storage.local: refresh tokens shouldn't sit on sync servers, and token
+// rotation would fight between two synced devices — after a reinstall the
+// user just clicks Sign in once.
+const SYNC_CONFIG_KEYS = ['overlays', 'settings', 'pineIds'];
+
+// Read one config key: sync first, falling back to storage.local for
+// pre-sync installs that background.js hasn't migrated yet.
+async function configGet(key) {
+  const s = await chrome.storage.sync.get(key);
+  if (s[key] !== undefined) return s[key];
+  const l = await chrome.storage.local.get(key);
+  return l[key];
+}
+
+async function configSet(patch) {
+  await chrome.storage.sync.set(patch);
 }
 
 async function getBaseUrl() {

@@ -199,7 +199,7 @@
 
   function onSymbolChanged(newSymbol) {
     log('symbol changed →', newSymbol);
-    clearAllOverlays();
+    softClearOverlays();
     currentSymbol = newSymbol;
     histFirstIndex = null; // new symbol → new series indexing
     window.postMessage({ tag: PAGE_TAG, dir: 'page->bg', type: 'symbolChanged', symbol: newSymbol }, '*');
@@ -230,12 +230,19 @@
       // studiesByUnit before the second one asks for it. Simpler than
       // per-unit in-flight dedup and cheaper than a batching protocol.
       drawSeriesQueue = drawSeriesQueue.then(() => drawSeries(
-        msg.metric, msg.color, msg.points, msg.isStrike, msg.label, msg.symbol, msg.unit, msg.hiddenMetrics, msg.excludeOutliers
+        msg.metric, msg.color, msg.points, msg.isStrike, msg.label, msg.symbol, msg.unit, msg.hiddenMetrics, msg.excludeOutliers, msg.hidden
       )).catch((e) => log('drawSeries error', e?.message || e));
       return;
     }
     if (msg.type === 'clearMetric') { clearMetric(msg.metric); return; }
     if (msg.type === 'clearAll')    { clearAllOverlays(); return; }
+    if (msg.type === 'softClear') {
+      // Chain onto the draw queue so an in-flight hijack can't repopulate
+      // a study we just blanked.
+      drawSeriesQueue = drawSeriesQueue.then(() => softClearOverlays())
+        .catch(e => log('softClear error', e?.message || e));
+      return;
+    }
     if (msg.type === 'pruneUnusedStudies') {
       // Chain onto the draw queue so we don't yank a study out from
       // under an in-flight hijack.
@@ -271,12 +278,17 @@
   }
 
   // ── drawing ──────────────────────────────────────────────────────────────
-  async function drawSeries(metric, color, points, isStrike, label, symbolAtDispatch, unit, hiddenMetrics, excludeOutliers) {
+  async function drawSeries(metric, color, points, isStrike, label, symbolAtDispatch, unit, hiddenMetrics, excludeOutliers, hidden) {
     if (!points?.length) { log('no points for', metric); return; }
     const stillCurrent = () => currentSymbol === symbolAtDispatch;
     if (!stillCurrent()) { log('symbol drifted before draw for', metric); return; }
 
-    clearMetric(metric);
+    // Sweep this metric's previous line tools only. Study-hosted data is
+    // replaced in place by drawViaStudyHijack — the old clearMetric here
+    // freed the slot and deleted + reinserted the study on every redraw,
+    // which reset TV's own hide (eye) state on the study.
+    sweepByLinkKey(k => k.startsWith(LINK_KEY_PREFIX + metric + ':'));
+    drawingsByMetric.delete(metric);
 
     const c = window._exposed_chartWidgetCollection;
     const w = c.activeChartWidget.value();
@@ -296,7 +308,7 @@
     // the OHLC scale — their values are on a totally different range. Push
     // them into a hijacked study which comes with its own left-hand axis.
     if (!isStrike && unit && !PRICE_UNITS.has(unit)) {
-      await drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent, unit, kind: 'overlay', hiddenMetrics, excludeOutliers: false });
+      await drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent, unit, kind: 'overlay', hiddenMetrics, excludeOutliers: false, hidden });
       return;
     }
 
@@ -315,10 +327,15 @@
         w, model, metric, label, color,
         points: expanded, ts, stillCurrent,
         unit: OHLC_UNIT_KEY, kind: 'ohlc', hiddenMetrics,
-        excludeOutliers: wantsOutlierFilter,
+        excludeOutliers: wantsOutlierFilter, hidden,
       });
       return;
     }
+
+    // Hidden metrics that render as line tools draw nothing — line tools
+    // have no TV-side hide state to preserve, and the sweep above already
+    // removed any previous ones.
+    if (hidden) { drawingsByMetric.delete(metric); return; }
 
     // Line-tool renderers are one-shot (no retained data to re-push), so
     // filter at draw time.
@@ -572,8 +589,8 @@
   // separate left-hand price scale that auto-fits its data range. We then
   // overwrite its computed values with ours so the axis lands where the
   // user's metric actually lives — no normalization, no shared price scale.
-  async function drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent, unit, kind, hiddenMetrics, excludeOutliers }) {
-    const record = await ensureAmoaStudyRecord({ w, model, metric, unit, kind, label, color, stillCurrent });
+  async function drawViaStudyHijack({ w, model, metric, label, color, points, ts, stillCurrent, unit, kind, hiddenMetrics, excludeOutliers, hidden }) {
+    const record = await ensureAmoaStudyRecord({ w, model, metric, unit, kind, label, color, stillCurrent, hidden });
     if (!record) {
       log('no AMOA Overlay study available for', metric,
           '— add one AMOA Overlay Pine indicator to your chart once so the extension can clone more.');
@@ -592,6 +609,26 @@
     log('pushed', added, 'combined points to AMOA', unit, 'study — metric', metric,
         'in slot', record.slotByMetric.get(metric),
         '(of', record.numSlots + ' slots)');
+
+    // Silent data replace for a hidden metric: leave TV's visibility state
+    // exactly as-is so the user's hide survives — whether it was the study
+    // eye (study visible=false, plot displays untouched) or a plot eye
+    // (display=0). Only force this plot's display off when the study itself
+    // is visible, which covers a freshly inserted study whose plots default
+    // to shown.
+    if (hidden) {
+      const studyVisible = src._properties?.visible?.value?.() ?? true;
+      if (studyVisible) {
+        try {
+          const styles = src._properties?.styles;
+          const sc = typeof styles?.childs === 'function' ? styles.childs() : styles;
+          const plot = sc?.[`plot_${record.slotByMetric.get(metric)}`];
+          const pc = typeof plot?.childs === 'function' ? plot.childs() : plot;
+          pc?.display?.setValue?.(0);
+        } catch (_) {}
+      }
+      return;
+    }
 
     // If the whole study was hidden (e.g. user hit TV's own eye on the
     // study), unhiding one metric via our overlay eye needs to also
@@ -619,11 +656,11 @@
   // insertStudy another copy using that same id, wait for it to attach,
   // and claim it. This turns "user manually added ONE AMOA Overlay" into
   // "extension can host N of them" without any per-user studyId configuration.
-  async function ensureAmoaStudyRecord({ w, model, metric, unit, kind, label, color, stillCurrent }) {
+  async function ensureAmoaStudyRecord({ w, model, metric, unit, kind, label, color, stillCurrent, hidden }) {
     let record = studyByUnit.get(unit);
     if (record && model.dataSourceForId(record.sourceId)) {
       claimSlot(record, metric, color);
-      applyAmoaSlotStyling(model.dataSourceForId(record.sourceId), record, metric, label, color);
+      applyAmoaSlotStyling(model.dataSourceForId(record.sourceId), record, metric, label, color, hidden);
       studiesByMetric.set(metric, record.sourceId);
       return record;
     }
@@ -653,7 +690,7 @@
     }
     installVisibilityGuard(model, record);
     claimSlot(record, metric, color);
-    applyAmoaSlotStyling(src, record, metric, label, color);
+    applyAmoaSlotStyling(src, record, metric, label, color, hidden);
     studiesByMetric.set(metric, sourceId);
     return record;
   }
@@ -956,10 +993,13 @@
         }
 
         // Data-cleared recovery (existing) — TV wipes the SortedMap on
-        // whole-study hide+show, so replay from cache.
+        // whole-study hide+show, so replay from cache. Only when the last
+        // push actually added rows: a push can legitimately land 0 (every
+        // point outlier-filtered or off-chart), and re-pushing then would
+        // just produce 0 again — an infinite 500ms filter/re-push loop.
         if (!r.dataByMetric.size) continue;
         const size = src.data?.()?.size?.();
-        if (size === 0) {
+        if (size === 0 && r._lastPushedCount !== 0) {
           const ts = model.timeScale?.();
           if (!ts) continue;
           const n = pushCombinedDataToStudy(src, r, ts);
@@ -1066,6 +1106,9 @@
       }
     }
     data._shareRead = true;
+    // Watcher's data-cleared recovery keys off this: size 0 with a
+    // last-push of 0 is an intentionally-empty study, not a TV wipe.
+    record._lastPushedCount = added;
     if (outliers) {
       log('excluded', outliers, 'outlier point(s) from AMOA', record.unit,
           'study — outside view band [' + band.lo.toFixed(2) + ', ' + band.hi.toFixed(2) + ']');
@@ -1087,7 +1130,7 @@
 
   // Style a specific slot of the shared study: set its title to the metric
   // label and its color to the metric's assigned overlay color.
-  function applyAmoaSlotStyling(src, record, metric, label, color) {
+  function applyAmoaSlotStyling(src, record, metric, label, color, hidden) {
     if (!src) return;
     const slot = record.slotByMetric.get(metric);
     if (slot == null) return;
@@ -1106,8 +1149,12 @@
     // from a previously-hidden state doesn't reliably wake up the OHLC
     // circle renderer — the dance does. Both steps are synchronous, so
     // the 500ms visibility watcher never observes the transient `0`.
-    try { plotProps?.display?.setValue?.(0); } catch (_) {}
-    try { plotProps?.display?.setValue?.(0xFFFFFFFF); } catch (_) {}
+    // Skipped for hidden metrics — the dance would flip a TV-hidden plot
+    // back on; drawViaStudyHijack handles their display bit instead.
+    if (!hidden) {
+      try { plotProps?.display?.setValue?.(0); } catch (_) {}
+      try { plotProps?.display?.setValue?.(0xFFFFFFFF); } catch (_) {}
+    }
     // For the OHLC (right-axis) kind, override the plot style to circles
     // so each snapshot renders as a discrete dot instead of connecting via
     // diagonals across strike jumps. TV's PlotStyle enum values:
@@ -1231,5 +1278,33 @@
     removeAllHijackStudies();
     drawingsByMetric.clear();
     log('cleared', removed, 'total overlay drawings +', studies, 'studies');
+  }
+
+  // Symbol-change / redraw reset. Line tools are anchored to the old
+  // symbol's bars, so they always go. The hijack studies stay on the chart
+  // with their data blanked: removing + reinserting them (clearAllOverlays)
+  // would wipe TV's own hide/eye state, so a hidden indicator came back as
+  // "nothing drawn" after a chart switch. The next drawSeries batch just
+  // replaces the data in place; slot assignments and colors stay stable.
+  function softClearOverlays() {
+    const removed = sweepByLinkKey(k => k.startsWith(LINK_KEY_PREFIX));
+    drawingsByMetric.clear();
+    const model = activeModel();
+    let blanked = 0;
+    for (const r of studyByUnit.values()) {
+      r.dataByMetric.clear();
+      const src = model?.dataSourceForId(r.sourceId);
+      if (!src) continue;
+      try {
+        const data = src.data();
+        data._shareRead = false;
+        data.clear();
+        data._shareRead = true;
+        src._invalidateLastNonEmptyPlotRowCache?.();
+        src.onDataUpdated?.();
+        blanked++;
+      } catch (_) {}
+    }
+    log('soft-cleared', removed, 'drawings, blanked', blanked, 'studies (kept on chart)');
   }
 })();

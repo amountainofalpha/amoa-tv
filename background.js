@@ -28,11 +28,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 const RELEASES_API  = 'https://api.github.com/repos/amountainofalpha/amoa-tv/releases/latest';
 const UPDATE_CHECK_TTL_MS = 6 * 60 * 60 * 1000;
 
-async function handleCheckUpdate() {
+async function handleCheckUpdate({ force } = {}) {
   const now = Date.now();
   const { updateCheck = {} } = await chrome.storage.local.get('updateCheck');
   let latest = updateCheck.latest || null;
-  if (!updateCheck.checkedAt || now - updateCheck.checkedAt >= UPDATE_CHECK_TTL_MS) {
+  if (force || !updateCheck.checkedAt || now - updateCheck.checkedAt >= UPDATE_CHECK_TTL_MS) {
     try {
       const res = await fetch(RELEASES_API, { headers: { accept: 'application/vnd.github+json' } });
       if (!res.ok) throw new Error('GitHub API ' + res.status);
@@ -66,6 +66,31 @@ function compareVersions(a, b) {
 
 // Refresh the badge whenever the service worker spins up (throttled by TTL).
 handleCheckUpdate().catch(() => {});
+
+// Extension load (install / update / reload) and browser startup bypass the
+// TTL — a fresh install may be the very version the badge advertised, so
+// re-resolve immediately instead of showing a stale NEW for up to 6 hours.
+chrome.runtime.onInstalled.addListener(() => { handleCheckUpdate({ force: true }).catch(() => {}); });
+chrome.runtime.onStartup.addListener(() => { handleCheckUpdate({ force: true }).catch(() => {}); });
+
+// One-time migration: config saved by pre-sync versions moves from
+// storage.local to storage.sync so it survives reinstalls from now on.
+// configGet's local fallback covers any read that races this.
+async function migrateConfigToSync() {
+  const [syncVals, localVals] = await Promise.all([
+    chrome.storage.sync.get(SYNC_CONFIG_KEYS),
+    chrome.storage.local.get(SYNC_CONFIG_KEYS),
+  ]);
+  const patch = {};
+  for (const k of SYNC_CONFIG_KEYS) {
+    if (syncVals[k] === undefined && localVals[k] !== undefined) patch[k] = localVals[k];
+  }
+  if (!Object.keys(patch).length) return;
+  await chrome.storage.sync.set(patch);
+  await chrome.storage.local.remove(Object.keys(patch));
+  console.log('[amoa-tv:bg] migrated config to storage.sync:', Object.keys(patch));
+}
+migrateConfigToSync().catch(() => {});
 
 // ============================================================================
 // Auth: OAuth 2.1 + PKCE against amoa's MCP server.
@@ -159,6 +184,7 @@ async function handleSignIn() {
     expires_at: Date.now() + (Number(t.expires_in || 3600) * 1000) - 30_000,
   });
   broadcastAuthState(true);
+  chrome.tabs.create({ url: `${base}/mcp/connected?client=TradingView` });
   return { ok: true };
 }
 
@@ -367,7 +393,7 @@ async function handleFetchHistory({ ticker: rawTicker, metrics }) {
   // permanently miss the forward-drawing branch.
   const cat = await handleFetchCatalog();
   const catByStat = cat.ok ? Object.fromEntries(cat.catalog.entries.map(e => [e.stat, e])) : {};
-  const { overlays = [] } = await chrome.storage.local.get('overlays');
+  const overlays = (await configGet('overlays')) || [];
   const overlayByMetric = Object.fromEntries(overlays.map(o => [o.metric, o]));
   const pairedFor = {}; // metric → sibling
   const statSet = new Set(metrics);
@@ -444,7 +470,7 @@ function yyyymmddToUnixSec(n) {
 // ============================================================================
 
 async function handleGetOverlays() {
-  const { overlays = [] } = await chrome.storage.local.get('overlays');
+  const overlays = (await configGet('overlays')) || [];
   // Auto-heal overlays saved before we tracked unit / pairedExpiration /
   // isStrike from the catalog. Without this, stored non-USD overlays keep
   // routing to the main-axis line branch instead of the study-hijack path.
@@ -460,7 +486,7 @@ async function handleGetOverlays() {
       if (o.isStrike !== e.isStrike)                        { o.isStrike = e.isStrike; changed = true; }
       if (!o.label && e.label)                              { o.label = e.label; changed = true; }
     }
-    if (changed) await chrome.storage.local.set({ overlays });
+    if (changed) await configSet({ overlays });
   }
   // Repair duplicate colors carried over from the old index-mod picker.
   // Walk in order — first occurrence keeps its color; any later overlay
@@ -478,7 +504,7 @@ async function handleGetOverlays() {
     seen.add(next);
     recolored = true;
   }
-  if (recolored) await chrome.storage.local.set({ overlays });
+  if (recolored) await configSet({ overlays });
   return { ok: true, overlays };
 }
 
@@ -495,7 +521,7 @@ function withOverlaysLock(fn) {
 
 async function handleAddOverlay({ metric, label, isStrike, unit, pairedExpiration }) {
   return withOverlaysLock(async () => {
-    const { overlays = [] } = await chrome.storage.local.get('overlays');
+    const overlays = (await configGet('overlays')) || [];
     if (overlays.some(o => o.metric === metric)) return { ok: true, overlays };
     const color = pickAvailableColor(overlays);
     overlays.push({
@@ -504,7 +530,7 @@ async function handleAddOverlay({ metric, label, isStrike, unit, pairedExpiratio
       unit: unit || null,
       pairedExpiration: pairedExpiration || null,
     });
-    await chrome.storage.local.set({ overlays });
+    await configSet({ overlays });
     return { ok: true, overlays };
   });
 }
@@ -522,9 +548,9 @@ function pickAvailableColor(overlays) {
 
 async function handleRemoveOverlay({ metric }) {
   return withOverlaysLock(async () => {
-    const { overlays = [] } = await chrome.storage.local.get('overlays');
+    const overlays = (await configGet('overlays')) || [];
     const next = overlays.filter(o => o.metric !== metric);
-    await chrome.storage.local.set({ overlays: next });
+    await configSet({ overlays: next });
     return { ok: true, overlays: next };
   });
 }
@@ -534,24 +560,58 @@ async function handleRemoveOverlay({ metric }) {
 // the duplicate-color repair in handleGetOverlays never remaps it.
 async function handleSetOverlayColor({ metric, color }) {
   return withOverlaysLock(async () => {
-    const { overlays = [] } = await chrome.storage.local.get('overlays');
+    const overlays = (await configGet('overlays')) || [];
     const o = overlays.find(x => x.metric === metric);
     if (!o) return { ok: true, overlays };
     o.color = color;
     o.customColor = true;
-    await chrome.storage.local.set({ overlays });
+    await configSet({ overlays });
     return { ok: true, overlays };
   });
 }
 
 async function handleToggleOverlay({ metric, hidden }) {
   return withOverlaysLock(async () => {
-    const { overlays = [] } = await chrome.storage.local.get('overlays');
+    const overlays = (await configGet('overlays')) || [];
     const o = overlays.find(x => x.metric === metric);
     if (!o) return { ok: true, overlays };
     o.hidden = !!hidden;
-    await chrome.storage.local.set({ overlays });
+    await configSet({ overlays });
     return { ok: true, overlays };
+  });
+}
+
+// Reinstall recovery: content.js mirrors the config into the
+// tradingview.com origin's localStorage, which survives extension
+// uninstalls, and offers it back when our storage comes up empty. Only
+// known config keys are accepted — auth is never part of the backup.
+// No-ops (restored: false) if any config already exists, so a stale
+// backup can't clobber a live setup.
+async function handleRestoreConfig({ config }) {
+  return withOverlaysLock(async () => {
+    const cur = await loadPineIds();
+    const curOverlays = (await configGet('overlays')) || [];
+    if (cur.overlay || cur.ohlc || curOverlays.length) {
+      return { ok: true, restored: false, pineIds: cur };
+    }
+    const patch = {};
+    if (Array.isArray(config?.overlays)) {
+      patch.overlays = config.overlays.filter(o => o && typeof o.metric === 'string');
+    }
+    if (config?.settings && typeof config.settings === 'object') {
+      patch.settings = config.settings;
+    }
+    const cleanHash = (h) => String(h || '').match(/[a-f0-9]{32}/i)?.[0] || null;
+    patch.pineIds = {
+      overlay: cleanHash(config?.pineIds?.overlay),
+      ohlc: cleanHash(config?.pineIds?.ohlc),
+    };
+    await configSet(patch);
+    console.log('[amoa-tv:bg] restored config from site backup:',
+                (patch.overlays || []).length, 'overlays, pineIds:',
+                !!patch.pineIds.overlay, !!patch.pineIds.ohlc);
+    broadcastPineIds(patch.pineIds);
+    return { ok: true, restored: true, pineIds: patch.pineIds };
   });
 }
 
@@ -571,20 +631,21 @@ async function handleGetAuthState() {
 
 // ============================================================================
 // Pine script IDs — user-configurable so each user's private Pine copies work.
-// Storage shape: { pineIds: { overlay: '<hash>', ohlc: '<hash>' } }
+// Storage shape (chrome.storage.sync, so onboarding survives reinstalls):
+// { pineIds: { overlay: '<hash>', ohlc: '<hash>' } }
 // Values are the raw 32-char hex hash portion of `USER;<hash>` — page.js
 // reconstructs the full pineId as needed.
 // ============================================================================
 
 async function loadPineIds() {
-  const { pineIds = {} } = await chrome.storage.local.get('pineIds');
+  const pineIds = (await configGet('pineIds')) || {};
   return { overlay: pineIds.overlay || null, ohlc: pineIds.ohlc || null };
 }
 
 async function savePineIds(patch) {
   const cur = await loadPineIds();
   const next = { ...cur, ...patch };
-  await chrome.storage.local.set({ pineIds: next });
+  await configSet({ pineIds: next });
   return next;
 }
 
@@ -625,6 +686,7 @@ const HANDLERS = {
   removeOverlay:  handleRemoveOverlay,
   toggleOverlay:  handleToggleOverlay,
   setOverlayColor: handleSetOverlayColor,
+  restoreConfig:  handleRestoreConfig,
   checkUpdate:    handleCheckUpdate,
   getAuthState:   handleGetAuthState,
   getPineIds:     handleGetPineIds,
