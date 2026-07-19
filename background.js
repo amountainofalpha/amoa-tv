@@ -405,22 +405,18 @@ async function handleFetchHistory({ ticker: rawTicker, metrics }) {
 
   const allDates = await loadSnapshotDates();
   if (!allDates?.length) return { ok: false, error: 'no snapshot dates available' };
-  // Use every snapshot the user's tier allows. available_snapshots already
-  // caps by subscription tier, so no additional client-side cap is needed.
-  const dates = allDates;
-  const dateBatches = chunk(dates, DATES_PER_BATCH);
+  // One range call per stat batch covers the user's full allowed history —
+  // the server clamps the range to the subscription tier's lookback window,
+  // so oldest/newest here are just hints, not access control.
   const statBatches = chunk(allStats, MAX_STATS_PER_BATCH);
 
   const seriesByMetric = Object.fromEntries(metrics.map(m => [m, []]));
 
-  const jobs = [];
-  for (const dBatch of dateBatches) {
-    for (const sBatch of statBatches) {
-      jobs.push(toolCall('ticker_metrics', {
-        tickers: [ticker], stats: sBatch, snapshot_dates: dBatch,
-      }));
-    }
-  }
+  // loadSnapshotDates sorts newest-first.
+  const jobs = statBatches.map(sBatch => toolCall('ticker_metrics', {
+    tickers: [ticker], stats: sBatch,
+    snapshot_start: allDates[allDates.length - 1], snapshot_end: allDates[0],
+  }));
   const results = await Promise.all(jobs);
 
   for (const r of results) {

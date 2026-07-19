@@ -13,9 +13,8 @@ const CLIENT_NAME = 'AMOA TradingView Overlay';
 // via the popup onboarding wizard (auto-detected once they add the Pine
 // script to their chart).
 
-// Depth = every snapshot date the user's tier grants (via available_snapshots).
-// MCP ticker_metrics is capped at 10 dates and 30 stats per call, so we batch.
-const DATES_PER_BATCH = 10;
+// Depth = every snapshot date the user's tier grants: one snapshot_start/
+// snapshot_end range call per stat batch (MCP caps stats at 30 per call).
 const MAX_STATS_PER_BATCH = 30;
 
 // Color palette assigned to overlays in add-order.

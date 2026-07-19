@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AMOA TradingView Overlay",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Overlay A Mountain Of Alpha levels on TradingView charts.",
   "action": {
     "default_popup": "popup.html",
